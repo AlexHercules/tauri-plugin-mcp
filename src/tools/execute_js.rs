@@ -1,53 +1,10 @@
-use serde::{Serialize, Serializer};
 use serde_json::Value;
-use std::fmt;
-use std::sync::mpsc;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Listener, Runtime};
+use tauri::{AppHandle, Runtime};
 
 use crate::desktop::get_emit_target;
 use crate::error::Error;
 use crate::socket_server::SocketResponse;
-
-// Define a custom error type for JavaScript execution operations
-#[derive(Debug)]
-pub enum ExecuteJsError {
-    WebviewOperation(String),
-    JavaScriptError(String),
-
-    Timeout(String),
-}
-
-// Implement Display for the error
-impl fmt::Display for ExecuteJsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExecuteJsError::WebviewOperation(s) => write!(f, "JavaScript execution error: {}", s),
-            ExecuteJsError::JavaScriptError(s) => write!(f, "JavaScript error: {}", s),
-            ExecuteJsError::Timeout(s) => write!(f, "Operation timed out: {}", s),
-        }
-    }
-}
-
-// Make the error serializable
-impl Serialize for ExecuteJsError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-// Support conversion from timeout error
-impl From<mpsc::RecvTimeoutError> for ExecuteJsError {
-    fn from(err: mpsc::RecvTimeoutError) -> Self {
-        ExecuteJsError::Timeout(format!(
-            "Timeout waiting for JavaScript execution response: {}",
-            err
-        ))
-    }
-}
+use crate::tools::webview::emit_and_wait;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ExecuteJsRequest {
@@ -70,94 +27,40 @@ pub async fn handle_execute_js<R: Runtime>(
     let request: ExecuteJsRequest = serde_json::from_value(payload)
         .map_err(|e| Error::Anyhow(format!("Invalid payload for executeJs: {}", e)))?;
 
-    // Get the window label or use "main" as default
     let window_label = request
         .window_label
         .clone()
         .unwrap_or_else(|| "main".to_string());
 
-    // Verify the webview exists (supports both WebviewWindow and multi-webview architectures)
     let _webview = crate::desktop::get_webview_for_eval(app, &window_label)
         .ok_or_else(|| Error::Anyhow(format!("Webview not found: {}", window_label)))?;
 
-    // Execute JavaScript and get the result
-    let result = execute_js_in_window(app.clone(), request).await;
+    let timeout_ms = request.timeout_ms.unwrap_or(5000);
+    let emit_target = get_emit_target(app, &window_label);
 
-    // Handle the result
-    match result {
-        Ok(response) => {
-            // Serialize the response
-            let data = serde_json::to_value(response)
-                .map_err(|e| Error::Anyhow(format!("Failed to serialize response: {}", e)))?;
-
-            Ok(SocketResponse {
-                success: true,
-                data: Some(data),
-                error: None,
-                id: None,
-            })
-        }
-        Err(e) => Ok(SocketResponse {
-            success: false,
-            data: None,
-            error: Some(e.to_string()),
-            id: None,
-        }),
-    }
-}
-
-// Helper function to execute JS in a window and await response
-async fn execute_js_in_window<R: Runtime>(
-    app: AppHandle<R>,
-    params: ExecuteJsRequest,
-) -> Result<ExecuteJsResponse, ExecuteJsError> {
-    // Get window label
-    let window_label = params
-        .window_label
-        .clone()
-        .unwrap_or_else(|| "main".to_string());
-
-    // Get timeout or use default (5 seconds)
-    let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(5000));
-
-    // Determine the target label for emit_to (uses configured fallback for multi-webview)
-    let emit_target = get_emit_target(&app, &window_label);
-
-    // Emit event to execute the JavaScript in the specified webview
-    app.emit_to(&emit_target, "execute-js", &params.code)
-        .map_err(|e| {
-            ExecuteJsError::WebviewOperation(format!("Failed to emit execute-js event: {}", e))
-        })?;
-
-    // Set up a channel to receive the response
-    let (tx, rx) = mpsc::channel();
-
-    // Listen for response
-    app.once("execute-js-response", move |event| {
-        let payload = event.payload().to_string();
-        let _ = tx.send(payload);
-    });
-
-    // Wait for the response with timeout
-    match rx.recv_timeout(timeout) {
+    // Use emit_and_wait with correlation ID (fixes previous emit-before-listen race)
+    match emit_and_wait(
+        app,
+        &emit_target,
+        "execute-js",
+        "execute-js-response",
+        serde_json::json!(request.code),
+        std::time::Duration::from_millis(timeout_ms),
+    ) {
         Ok(result_string) => {
-            // Parse the response JSON
             let response: Value = serde_json::from_str(&result_string).map_err(|e| {
-                ExecuteJsError::JavaScriptError(format!("Failed to parse response: {}", e))
+                Error::Anyhow(format!("Failed to parse JS response: {}", e))
             })?;
 
-            // Check if result contains an error
-            if let Some(error) = response.get("error") {
-                if let Some(error_str) = error.as_str() {
-                    return Err(ExecuteJsError::JavaScriptError(error_str.to_string()));
-                } else {
-                    return Err(ExecuteJsError::JavaScriptError(
-                        "Unknown JavaScript execution error".to_string(),
-                    ));
-                }
+            if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
+                return Ok(SocketResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error.to_string()),
+                    id: None,
+                });
             }
 
-            // Build the ExecuteJsResponse
             let result = response
                 .get("result")
                 .and_then(|r| r.as_str())
@@ -170,11 +73,24 @@ async fn execute_js_in_window<R: Runtime>(
                 .unwrap_or("unknown")
                 .to_string();
 
-            Ok(ExecuteJsResponse {
+            let data = serde_json::to_value(ExecuteJsResponse {
                 result,
                 result_type,
             })
+            .map_err(|e| Error::Anyhow(format!("Failed to serialize response: {}", e)))?;
+
+            Ok(SocketResponse {
+                success: true,
+                data: Some(data),
+                error: None,
+                id: None,
+            })
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Ok(SocketResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Timeout waiting for JS execution: {}", e)),
+            id: None,
+        }),
     }
 }

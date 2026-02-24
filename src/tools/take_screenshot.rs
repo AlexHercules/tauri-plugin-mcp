@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::shared::ScreenshotParams;
-use base64;
+use base64::Engine;
 use image::DynamicImage;
 use serde_json::Value;
 use tauri::{AppHandle, Runtime};
@@ -118,7 +118,7 @@ pub fn process_image(dynamic_image: DynamicImage, params: &ScreenshotParams) -> 
 
     let output_data = process_image_to_bytes(dynamic_image, quality, max_width, max_size_bytes)?;
 
-    let base64_data = base64::encode(&output_data);
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&output_data);
 
     // Final check - reject if still too large
     if base64_data.len() > 3 * 1024 * 1024 {
@@ -177,7 +177,7 @@ pub fn process_thumbnail(dynamic_image: DynamicImage) -> Result<String> {
         300 * 1024,            // max_size: 300KB
     )?;
 
-    let base64_data = base64::encode(&output_data);
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&output_data);
     Ok(format!("data:image/jpeg;base64,{}", base64_data))
 }
 

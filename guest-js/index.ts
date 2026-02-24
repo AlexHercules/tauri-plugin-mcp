@@ -16,6 +16,25 @@ let waitForUnlistenFunction: (() => void) | null = null;
 let navigateWebviewUnlistenFunction: (() => void) | null = null;
 let manageZoomUnlistenFunction: (() => void) | null = null;
 
+// ---- Correlation ID helpers ----
+// Extract the _correlationId from an event payload (injected by Rust's emit_and_wait).
+function getCorrelationId(payload: any): string | null {
+    if (typeof payload === 'object' && payload !== null && typeof payload._correlationId === 'string') {
+        return payload._correlationId;
+    }
+    return null;
+}
+
+// Emit a response on the correlated event name: "{baseEventName}-{correlationId}"
+async function emitResponse(baseEventName: string, correlationId: string | null, data: any): Promise<void> {
+    if (correlationId) {
+        await emit(`${baseEventName}-${correlationId}`, data);
+    } else {
+        // Fallback for requests without correlation IDs (should not happen with updated Rust)
+        await emit(baseEventName, data);
+    }
+}
+
 // Global ref map: stores numbered references to interactive elements from the last getPageMap call
 let _pageMapRefElements: Map<number, Element> = new Map();
 
@@ -110,6 +129,7 @@ export async function cleanupPluginListeners() {
 
 async function handleGetElementPositionRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received get-element-position, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
 
     try {
         const { selectorType, selectorValue, shouldClick = false } = event.payload;
@@ -221,7 +241,7 @@ async function handleGetElementPositionRequest(event: any) {
             clickResult = clickElement(element, elementViewportCssX, elementViewportCssY);
         }
 
-        await emit('get-element-position-response', {
+        await emitResponse('get-element-position-response', correlationId, {
             success: true,
             data: {
                 x: targetX,
@@ -261,7 +281,7 @@ async function handleGetElementPositionRequest(event: any) {
 
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error handling get-element-position request', error);
-        await emit('get-element-position-response', {
+        await emitResponse('get-element-position-response', correlationId, {
             success: false,
             error: error instanceof Error ? error.toString() : String(error)
         }).catch(e => console.error('TAURI-PLUGIN-MCP: Error emitting error response', e));
@@ -377,14 +397,15 @@ function clickElement(element: Element, centerX: number, centerY: number) {
 
 async function handleDomContentRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received got-dom-content, payload:', event.payload);
-    
+    const correlationId = getCorrelationId(event.payload);
+
     try {
         const domContent = getDomContent();
-        await emit('got-dom-content-response', domContent);
+        await emitResponse('got-dom-content-response', correlationId, domContent);
         console.log('TAURI-PLUGIN-MCP: Emitted got-dom-content-response');
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error handling dom content request', error);
-        await emit('got-dom-content-response', '').catch(e => 
+        await emitResponse('got-dom-content-response', correlationId, '').catch(e =>
             console.error('TAURI-PLUGIN-MCP: Error emitting empty response', e)
         );
     }
@@ -484,6 +505,7 @@ function waitForDomStable(quietMs: number = 300, maxWaitMs: number = 3000): Prom
 
 async function handleGetPageMapRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received get-page-map, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
 
     try {
         const options = typeof event.payload === 'object' ? event.payload : {};
@@ -497,11 +519,11 @@ async function handleGetPageMapRequest(event: any) {
         }
 
         const result = getPageMap(options);
-        await emit('get-page-map-response', JSON.stringify(result));
+        await emitResponse('get-page-map-response', correlationId, JSON.stringify(result));
         console.log('TAURI-PLUGIN-MCP: Emitted get-page-map-response');
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error handling get-page-map request', error);
-        await emit('get-page-map-response', JSON.stringify({
+        await emitResponse('get-page-map-response', correlationId, JSON.stringify({
             url: window.location.href,
             title: document.title,
             viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -815,7 +837,8 @@ function getElementByRef(ref: number): Element | null {
 
 async function handleLocalStorageRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received get-local-storage, payload:', event.payload);
-    
+    const correlationId = getCorrelationId(event.payload);
+
     try {
         const { action, key, value } = event.payload;
         
@@ -854,14 +877,14 @@ async function handleLocalStorageRequest(event: any) {
         });
         
         const result = performLocalStorageOperation(action, processedKey, processedValue);
-        await emit('get-local-storage-response', result);
+        await emitResponse('get-local-storage-response', correlationId, result);
         console.log('TAURI-PLUGIN-MCP: Emitted get-local-storage-response');
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error handling localStorage request', error);
-        await emit('get-local-storage-response', { 
-            success: false, 
-            error: error instanceof Error ? error.toString() : String(error) 
-        }).catch(e => 
+        await emitResponse('get-local-storage-response', correlationId, {
+            success: false,
+            error: error instanceof Error ? error.toString() : String(error)
+        }).catch(e =>
             console.error('TAURI-PLUGIN-MCP: Error emitting error response', e)
         );
     }
@@ -941,32 +964,35 @@ function performLocalStorageOperation(action: string, key?: string | any, value?
 // Handle JS execution requests
 async function handleJsExecutionRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received execute-js, payload:', event.payload);
-    
+    const correlationId = getCorrelationId(event.payload);
+
     try {
-        // Extract the code to execute
-        const code = event.payload;
-        
+        // Extract the code to execute — may be wrapped in _payload by emit_and_wait
+        const code = (typeof event.payload === 'object' && event.payload._payload !== undefined)
+            ? event.payload._payload
+            : event.payload;
+
         // Execute the code
         const result = executeJavaScript(code);
-        
+
         // Prepare response with result and type information
         const response = {
             result: typeof result === 'object' ? JSON.stringify(result) : String(result),
             type: typeof result
         };
-        
+
         // Send back the result
-        await emit('execute-js-response', response);
+        await emitResponse('execute-js-response', correlationId, response);
         console.log('TAURI-PLUGIN-MCP: Emitted execute-js-response');
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error executing JavaScript:', error);
         const errorMessage = error instanceof Error ? error.toString() : String(error);
-        
-        await emit('execute-js-response', {
+
+        await emitResponse('execute-js-response', correlationId, {
             result: null,
             type: 'error',
             error: errorMessage
-        }).catch(e => 
+        }).catch(e =>
             console.error('TAURI-PLUGIN-MCP: Error emitting error response', e)
         );
     }
@@ -987,6 +1013,7 @@ function executeJavaScript(code: string): any {
 
 async function handleSendTextToElementRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received send-text-to-element, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
 
     try {
         const { selectorType, selectorValue, text, delayMs = 20 } = event.payload;
@@ -1085,7 +1112,7 @@ async function handleSendTextToElementRequest(event: any) {
             console.warn('TAURI-PLUGIN-MCP: Element is not an input, textarea, or contentEditable. Text was set directly but may not behave as expected.');
         }
         
-        await emit('send-text-to-element-response', {
+        await emitResponse('send-text-to-element-response', correlationId, {
             success: true,
             data: {
                 element: {
@@ -1100,7 +1127,7 @@ async function handleSendTextToElementRequest(event: any) {
         });
     } catch (error) {
         console.error('TAURI-PLUGIN-MCP: Error handling send-text-to-element request', error);
-        await emit('send-text-to-element-response', {
+        await emitResponse('send-text-to-element-response', correlationId, {
             success: false,
             error: error instanceof Error ? error.toString() : String(error)
         }).catch(e => console.error('TAURI-PLUGIN-MCP: Error emitting error response', e));
@@ -1473,8 +1500,9 @@ async function typeIntoSlateEditor(element: HTMLElement, text: string, delayMs: 
 // --- get_page_state handler ---
 async function handleGetPageStateRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received get-page-state');
+    const correlationId = getCorrelationId(event.payload);
     try {
-        await emit('get-page-state-response', JSON.stringify({
+        await emitResponse('get-page-state-response', correlationId, JSON.stringify({
             success: true,
             data: {
                 url: window.location.href,
@@ -1485,7 +1513,7 @@ async function handleGetPageStateRequest(event: any) {
             }
         }));
     } catch (error) {
-        await emit('get-page-state-response', JSON.stringify({
+        await emitResponse('get-page-state-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1495,6 +1523,7 @@ async function handleGetPageStateRequest(event: any) {
 // --- navigate_back handler ---
 async function handleNavigateBackRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received navigate-back, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { direction, delta } = event.payload || {};
 
@@ -1509,7 +1538,7 @@ async function handleNavigateBackRequest(event: any) {
         // Wait briefly for navigation to take effect
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        await emit('navigate-back-response', JSON.stringify({
+        await emitResponse('navigate-back-response', correlationId, JSON.stringify({
             success: true,
             data: {
                 url: window.location.href,
@@ -1517,7 +1546,7 @@ async function handleNavigateBackRequest(event: any) {
             }
         }));
     } catch (error) {
-        await emit('navigate-back-response', JSON.stringify({
+        await emitResponse('navigate-back-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1527,6 +1556,7 @@ async function handleNavigateBackRequest(event: any) {
 // --- scroll_page handler ---
 async function handleScrollPageRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received scroll-page, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { direction, amount, toRef, toTop, toBottom } = event.payload || {};
 
@@ -1560,7 +1590,7 @@ async function handleScrollPageRequest(event: any) {
         // Wait for smooth scroll to settle
         await new Promise(resolve => setTimeout(resolve, 350));
 
-        await emit('scroll-page-response', JSON.stringify({
+        await emitResponse('scroll-page-response', correlationId, JSON.stringify({
             success: true,
             data: {
                 scrollPosition: { x: window.scrollX, y: window.scrollY },
@@ -1569,7 +1599,7 @@ async function handleScrollPageRequest(event: any) {
             }
         }));
     } catch (error) {
-        await emit('scroll-page-response', JSON.stringify({
+        await emitResponse('scroll-page-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1598,6 +1628,7 @@ function resolveElement(field: { ref?: number; selectorType?: string; selectorVa
 
 async function handleFillFormRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received fill-form, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { fields, submitRef } = event.payload || {};
 
@@ -1663,12 +1694,12 @@ async function handleFillFormRequest(event: any) {
             }
         }
 
-        await emit('fill-form-response', JSON.stringify({
+        await emitResponse('fill-form-response', correlationId, JSON.stringify({
             success: true,
             data: { fields: results, submit: submitResult }
         }));
     } catch (error) {
-        await emit('fill-form-response', JSON.stringify({
+        await emitResponse('fill-form-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1678,6 +1709,7 @@ async function handleFillFormRequest(event: any) {
 // --- wait_for handler ---
 async function handleWaitForRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received wait-for, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { text, selector, ref: refNum, state = 'visible', timeoutMs = 10000 } = event.payload || {};
         const pollInterval = 200;
@@ -1760,7 +1792,7 @@ async function handleWaitForRequest(event: any) {
             }, timeoutMs);
         });
 
-        await emit('wait-for-response', JSON.stringify({
+        await emitResponse('wait-for-response', correlationId, JSON.stringify({
             success: true,
             data: {
                 found: result.found,
@@ -1769,7 +1801,7 @@ async function handleWaitForRequest(event: any) {
             }
         }));
     } catch (error) {
-        await emit('wait-for-response', JSON.stringify({
+        await emitResponse('wait-for-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1778,28 +1810,29 @@ async function handleWaitForRequest(event: any) {
 
 async function handleNavigateWebviewRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received navigate-webview, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { action } = event.payload;
         if (action === 'back') {
             window.history.back();
-            await emit('navigate-webview-response', JSON.stringify({
+            await emitResponse('navigate-webview-response', correlationId, JSON.stringify({
                 success: true,
                 data: { action: 'back' }
             }));
         } else if (action === 'forward') {
             window.history.forward();
-            await emit('navigate-webview-response', JSON.stringify({
+            await emitResponse('navigate-webview-response', correlationId, JSON.stringify({
                 success: true,
                 data: { action: 'forward' }
             }));
         } else {
-            await emit('navigate-webview-response', JSON.stringify({
+            await emitResponse('navigate-webview-response', correlationId, JSON.stringify({
                 success: false,
                 error: `Unknown navigate-webview action: ${action}`
             }));
         }
     } catch (error) {
-        await emit('navigate-webview-response', JSON.stringify({
+        await emitResponse('navigate-webview-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));
@@ -1808,12 +1841,13 @@ async function handleNavigateWebviewRequest(event: any) {
 
 async function handleManageZoomRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received manage-zoom, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
     try {
         const { action } = event.payload;
         if (action === 'get') {
             // Use visualViewport scale if available, fall back to devicePixelRatio-based detection
             const visualScale = (window as any).visualViewport?.scale ?? null;
-            await emit('manage-zoom-response', JSON.stringify({
+            await emitResponse('manage-zoom-response', correlationId, JSON.stringify({
                 success: true,
                 data: {
                     devicePixelRatio: window.devicePixelRatio,
@@ -1821,13 +1855,13 @@ async function handleManageZoomRequest(event: any) {
                 }
             }));
         } else {
-            await emit('manage-zoom-response', JSON.stringify({
+            await emitResponse('manage-zoom-response', correlationId, JSON.stringify({
                 success: false,
                 error: `Unknown manage-zoom action: ${action}`
             }));
         }
     } catch (error) {
-        await emit('manage-zoom-response', JSON.stringify({
+        await emitResponse('manage-zoom-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));

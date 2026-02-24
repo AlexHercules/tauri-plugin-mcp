@@ -8,10 +8,7 @@ pub use models::*;
 
 #[cfg(desktop)]
 mod desktop;
-#[cfg(mobile)]
-mod mobile;
 
-mod commands;
 mod error;
 mod models;
 pub mod shared;
@@ -27,14 +24,14 @@ pub use shared::{
 
 #[cfg(desktop)]
 use desktop::TauriMcp;
-#[cfg(mobile)]
-use mobile::TauriMcp;
 
 /// Extensions to [`tauri::App`], [`tauri::AppHandle`] and [`tauri::Window`] to access the tauri-mcp APIs.
+#[cfg(desktop)]
 pub trait TauriMcpExt<R: Runtime> {
     fn tauri_mcp(&self) -> &TauriMcp<R>;
 }
 
+#[cfg(desktop)]
 impl<R: Runtime, T: Manager<R>> crate::TauriMcpExt<R> for T {
     fn tauri_mcp(&self) -> &TauriMcp<R> {
         self.state::<TauriMcp<R>>().inner()
@@ -124,6 +121,15 @@ impl PluginConfig {
     /// Set an auth token for socket server authentication.
     pub fn auth_token(mut self, token: String) -> Self {
         self.auth_token = Some(token);
+        self
+    }
+
+    /// Convenience: configure TCP on localhost (127.0.0.1) with the given port.
+    pub fn tcp_localhost(mut self, port: u16) -> Self {
+        self.socket_type = SocketType::Tcp {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
         self
     }
 }

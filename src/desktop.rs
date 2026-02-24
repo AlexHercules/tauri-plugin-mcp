@@ -383,6 +383,8 @@ impl<R: Runtime> TauriMcp<R> {
     }
 
     // Text input simulation
+    // TODO: Wrap Enigo usage in tokio::task::spawn_blocking once Enigo is Send on all platforms.
+    // Currently Enigo is not Send on macOS (Cocoa APIs), so thread::sleep runs on the async executor.
     pub async fn simulate_text_input_async(
         &self,
         params: TextInputRequest,
@@ -462,7 +464,7 @@ impl<R: Runtime> McpInterface for TauriMcp<R> {
             save_to_disk: params.save_to_disk,
             thumbnail: params.thumbnail,
         };
-        match futures::executor::block_on(self.take_screenshot_async(request)) {
+        match tokio::runtime::Handle::current().block_on(self.take_screenshot_async(request)) {
             Ok(response) => {
                 // Convert to the shared result type
                 Ok(SharedScreenshotResult {

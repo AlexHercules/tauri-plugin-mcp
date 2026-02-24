@@ -4,7 +4,7 @@ import * as fs from 'fs';
 
 // Constants
 const SOCKET_FILENAME = 'tauri-mcp.sock';
-const DEFAULT_SOCKET_PATH = `/private/tmp/${SOCKET_FILENAME}`;
+const DEFAULT_SOCKET_PATH = `${os.tmpdir()}/${SOCKET_FILENAME}`;
 
 // Connection configuration types
 export interface IpcConfig {

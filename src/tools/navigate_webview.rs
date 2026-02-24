@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::mpsc;
-use tauri::{AppHandle, Emitter, Listener, Runtime};
+use tauri::{AppHandle, Runtime};
 
 use crate::desktop::{get_emit_target, get_webview_for_eval};
 use crate::socket_server::SocketResponse;
+use crate::tools::webview::{emit_and_wait, parse_js_response};
 
 #[derive(Debug, Deserialize)]
 struct NavigatePayload {
@@ -67,26 +67,20 @@ pub async fn handle_navigate_webview<R: Runtime>(
         }
         "back" | "forward" => {
             let emit_target = get_emit_target(app, &window_label);
-            let (tx, rx) = mpsc::channel();
-
-            app.once("navigate-webview-response", move |event| {
-                let _ = tx.send(event.payload().to_string());
-            });
 
             let js_payload = serde_json::json!({
                 "action": parsed.action,
             });
 
-            app.emit_to(&emit_target, "navigate-webview", js_payload)
-                .map_err(|e| {
-                    crate::error::Error::Anyhow(format!(
-                        "Failed to emit navigate-webview event: {}",
-                        e
-                    ))
-                })?;
-
-            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(result) => Ok(crate::tools::webview::parse_js_response(&result)),
+            match emit_and_wait(
+                app,
+                &emit_target,
+                "navigate-webview",
+                "navigate-webview-response",
+                js_payload,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(result) => Ok(parse_js_response(&result)),
                 Err(e) => Ok(SocketResponse {
                     success: false,
                     data: None,

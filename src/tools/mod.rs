@@ -1,6 +1,6 @@
 use serde_json::Value;
 use tauri::{AppHandle, Runtime};
-use log::info;
+use log::{info, debug};
 
 use crate::shared::commands;
 use crate::socket_server::SocketResponse;
@@ -50,9 +50,9 @@ pub async fn handle_command<R: Runtime>(
     command: &str,
     payload: Value,
 ) -> crate::Result<SocketResponse> {
-    // Log the full request payload
-    info!(
-        "[TAURI_MCP] Received command: {} with payload: {}",
+    info!("[TAURI_MCP] Received command: {}", command);
+    debug!(
+        "[TAURI_MCP] Command {} payload: {}",
         command,
         serde_json::to_string_pretty(&payload)
             .unwrap_or_else(|_| "[failed to serialize]".to_string())
@@ -104,20 +104,19 @@ pub async fn handle_command<R: Runtime>(
         );
 
         if let Some(ref data) = response.data {
-            // Only print a preview of the data for large responses
             let data_str =
                 serde_json::to_string(data).unwrap_or_else(|_| "[failed to serialize]".to_string());
             if data_str.len() > 1000 {
-                info!(
+                debug!(
                     "[TAURI_MCP] Response data preview (first 1000 chars): {}",
                     &data_str[..1000.min(data_str.len())]
                 );
-                info!(
+                debug!(
                     "[TAURI_MCP] ... (response data truncated, total length: {} bytes)",
                     data_str.len()
                 );
             } else {
-                info!("[TAURI_MCP] Response data: {}", data_str);
+                debug!("[TAURI_MCP] Response data: {}", data_str);
             }
         }
 
@@ -132,4 +131,49 @@ pub async fn handle_command<R: Runtime>(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::shared::commands;
+
+    #[test]
+    fn test_command_constants_are_unique() {
+        let all_commands = [
+            commands::PING,
+            commands::TAKE_SCREENSHOT,
+            commands::GET_DOM,
+            commands::MANAGE_LOCAL_STORAGE,
+            commands::EXECUTE_JS,
+            commands::MANAGE_WINDOW,
+            commands::SIMULATE_TEXT_INPUT,
+            commands::SIMULATE_MOUSE_MOVEMENT,
+            commands::GET_ELEMENT_POSITION,
+            commands::SEND_TEXT_TO_ELEMENT,
+            commands::GET_PAGE_MAP,
+            commands::GET_PAGE_STATE,
+            commands::NAVIGATE_BACK,
+            commands::SCROLL_PAGE,
+            commands::FILL_FORM,
+            commands::WAIT_FOR,
+            commands::GET_APP_INFO,
+            commands::LIST_WINDOWS,
+            commands::NAVIGATE_WEBVIEW,
+            commands::MANAGE_EVENTS,
+            commands::MANAGE_COOKIES,
+            commands::MANAGE_DEVTOOLS,
+            commands::MANAGE_ZOOM,
+            commands::MANAGE_WEBVIEW_STATE,
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for cmd in &all_commands {
+            assert!(
+                seen.insert(*cmd),
+                "Duplicate command constant: {}",
+                cmd
+            );
+        }
+        assert_eq!(seen.len(), 24, "Expected 24 unique commands");
+    }
 }

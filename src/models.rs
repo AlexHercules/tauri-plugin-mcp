@@ -113,13 +113,18 @@ pub struct TypeTextRequest {
 
 // Screenshot request - updated to use shared interface
 #[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenshotRequest {
+    #[serde(alias = "window_label")]
     pub window_label: String,
     pub quality: Option<i32>,
+    #[serde(alias = "max_width")]
     pub max_width: Option<i32>,
+    #[serde(alias = "max_size_mb")]
     pub max_size_mb: Option<f32>,
+    #[serde(alias = "output_dir")]
     pub output_dir: Option<String>,
+    #[serde(alias = "save_to_disk")]
     pub save_to_disk: Option<bool>,
     pub thumbnail: Option<bool>,
 }
@@ -201,7 +206,7 @@ pub struct LocalStorageRequest {
 }
 
 // Window manager request model
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WindowManagerRequest {
     pub window_label: Option<String>,
     pub operation: String,

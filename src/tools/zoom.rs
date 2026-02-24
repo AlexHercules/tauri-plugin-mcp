@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::mpsc;
-use tauri::{AppHandle, Emitter, Listener, Runtime};
+use tauri::{AppHandle, Runtime};
 
 use crate::desktop::{get_emit_target, get_webview_for_eval};
 use crate::socket_server::SocketResponse;
+use crate::tools::webview::{emit_and_wait, parse_js_response};
 
 #[derive(Debug, Deserialize)]
 struct ZoomPayload {
@@ -44,23 +44,16 @@ pub async fn handle_manage_zoom<R: Runtime>(
         }
         "get" => {
             let emit_target = get_emit_target(app, &window_label);
-            let (tx, rx) = mpsc::channel();
 
-            app.once("manage-zoom-response", move |event| {
-                let _ = tx.send(event.payload().to_string());
-            });
-
-            app.emit_to(
+            match emit_and_wait(
+                app,
                 &emit_target,
                 "manage-zoom",
+                "manage-zoom-response",
                 serde_json::json!({"action": "get"}),
-            )
-            .map_err(|e| {
-                crate::error::Error::Anyhow(format!("Failed to emit manage-zoom event: {}", e))
-            })?;
-
-            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(result) => Ok(crate::tools::webview::parse_js_response(&result)),
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(result) => Ok(parse_js_response(&result)),
                 Err(e) => Ok(SocketResponse {
                     success: false,
                     data: None,

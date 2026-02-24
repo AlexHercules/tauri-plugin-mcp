@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{AppHandle, Runtime};
-use log::{info, error, trace};
+use log::{info, warn, error, trace};
 
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +123,7 @@ pub struct SocketServer<R: Runtime> {
     app: AppHandle<R>,
     running: Arc<Mutex<bool>>,
     auth_token: Option<String>,
+    token_file_path: Option<String>,
 }
 
 impl<R: Runtime> SocketServer<R> {
@@ -157,6 +158,7 @@ impl<R: Runtime> SocketServer<R> {
             app,
             running: Arc::new(Mutex::new(false)),
             auth_token,
+            token_file_path: None,
         }
     }
 
@@ -168,13 +170,50 @@ impl<R: Runtime> SocketServer<R> {
                 // Create a name for our socket based on the platform
                 let socket_name = self.get_socket_name(path)?;
 
+                // Stale socket cleanup: try connecting to see if another instance is running
+                #[cfg(unix)]
+                {
+                    let socket_path = if let Some(p) = path {
+                        p.to_string_lossy().to_string()
+                    } else {
+                        std::env::temp_dir().join("tauri-mcp.sock").to_string_lossy().to_string()
+                    };
+                    if let Ok(metadata) = std::fs::symlink_metadata(&socket_path) {
+                        use std::os::unix::fs::FileTypeExt;
+                        if !metadata.file_type().is_socket() {
+                            return Err(Error::Io(format!(
+                                "Path {} exists but is not a Unix socket — refusing to remove",
+                                socket_path
+                            )));
+                        }
+                        match std::os::unix::net::UnixStream::connect(&socket_path) {
+                            Ok(_) => {
+                                return Err(Error::Io(format!(
+                                    "Socket {} is in use by another instance",
+                                    socket_path
+                                )));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                info!("[TAURI_MCP] Removing stale socket file: {}", socket_path);
+                                let _ = std::fs::remove_file(&socket_path);
+                            }
+                            Err(e) => {
+                                return Err(Error::Io(format!(
+                                    "Cannot connect to socket {} and cannot determine if it is stale: {}",
+                                    socket_path, e
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 // Configure and create the IPC listener
                 let opts = ListenerOptions::new().name(socket_name);
                 let ipc_listener = opts.create_sync()
                     .map_err(|e| {
                         info!("[TAURI_MCP] Error creating IPC socket listener: {}", e);
                         if e.kind() == std::io::ErrorKind::AddrInUse {
-                            Error::Io(format!("Socket address already in use. If the socket file exists, it may be a stale socket. Try removing it manually."))
+                            Error::Io(format!("Socket address already in use. Another instance may be running."))
                         } else {
                             Error::Io(format!("Failed to create local socket: {}", e))
                         }
@@ -182,6 +221,26 @@ impl<R: Runtime> SocketServer<R> {
                 UnifiedListener::Ipc(ipc_listener)
             }
             SocketType::Tcp { host, port } => {
+                // TCP host validation: reject non-loopback without auth token
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    if !ip.is_loopback() {
+                        if self.auth_token.is_none() {
+                            return Err(Error::Io(format!(
+                                "Binding to non-loopback address {} without an auth token is not allowed. \
+                                 Set an auth token or use a loopback address (127.0.0.1 / ::1).",
+                                host
+                            )));
+                        }
+                        warn!(
+                            "[TAURI_MCP] WARNING: Binding to non-loopback address {}:{}. \
+                             Ensure auth token is configured and network is trusted.",
+                            host, port
+                        );
+                    }
+                } else {
+                    warn!("[TAURI_MCP] Could not parse host '{}' as IP address", host);
+                }
+
                 // Create TCP listener
                 let addr = format!("{}:{}", host, port);
                 let tcp_listener = TcpListener::bind(&addr)
@@ -209,14 +268,41 @@ impl<R: Runtime> SocketServer<R> {
                     format!("{}/tauri-mcp-{}.token", std::env::temp_dir().display(), port)
                 }
             };
-            if let Err(e) = std::fs::write(&token_path, token) {
-                error!("[TAURI_MCP] Failed to write auth token file {}: {}", token_path, e);
-            } else {
-                info!("[TAURI_MCP] Auth token written to {}", token_path);
+
+            // Write with restrictive permissions on Unix (owner-only read/write)
+            let write_result = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&token_path)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            f.write_all(token.as_bytes())
+                        })
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&token_path, token)
+                }
+            };
+
+            match write_result {
+                Ok(_) => {
+                    info!("[TAURI_MCP] Auth token written to {}", token_path);
+                    self.token_file_path = Some(token_path);
+                }
+                Err(e) => {
+                    error!("[TAURI_MCP] Failed to write auth token file {}: {}", token_path, e);
+                }
             }
         }
 
-        *self.running.lock().unwrap() = true;
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = true;
         info!("[TAURI_MCP] Set running flag to true");
 
         let app = self.app.clone();
@@ -237,10 +323,10 @@ impl<R: Runtime> SocketServer<R> {
                 }
             }
 
-            let listener_guard = listener.lock().unwrap();
+            let listener_guard = listener.lock().unwrap_or_else(|e| e.into_inner());
 
             loop {
-                if !*running.lock().unwrap() {
+                if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
                     break;
                 }
 
@@ -248,7 +334,7 @@ impl<R: Runtime> SocketServer<R> {
                     UnifiedListener::Ipc(ipc_listener) => {
                         // Handle IPC connections
                         for conn in ipc_listener.incoming() {
-                            if !*running.lock().unwrap() {
+                            if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
                                 break;
                             }
 
@@ -285,7 +371,7 @@ impl<R: Runtime> SocketServer<R> {
                             }
 
                             // Check the running flag after each connection
-                            if !*running.lock().unwrap() {
+                            if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
                                 break;
                             }
                         }
@@ -296,7 +382,7 @@ impl<R: Runtime> SocketServer<R> {
                         tcp_listener.set_nonblocking(true).ok();
                         
                         loop {
-                            if !*running.lock().unwrap() {
+                            if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
                                 break;
                             }
 
@@ -367,7 +453,20 @@ impl<R: Runtime> SocketServer<R> {
     pub fn stop(&self) -> crate::Result<()> {
         info!("[TAURI_MCP] Stopping socket server");
         // Set running flag to false to stop the server thread
-        *self.running.lock().unwrap() = false;
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+
+        // Delete the auth token file if we created one
+        if let Some(ref path) = self.token_file_path {
+            match std::fs::remove_file(path) {
+                Ok(_) => info!("[TAURI_MCP] Deleted auth token file: {}", path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone — not an error
+                }
+                Err(e) => {
+                    error!("[TAURI_MCP] Failed to delete auth token file {}: {}", path, e);
+                }
+            }
+        }
 
         // The interprocess crate automatically cleans up the socket file on drop for Unix platforms
         info!("[TAURI_MCP] Socket server stopped");
@@ -588,4 +687,64 @@ fn handle_client<R: Runtime>(stream: UnifiedStream, app: AppHandle<R>, rt_handle
         line.clear();
         } // End of loop
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_socket_request_deserialization() {
+        let json = r#"{"command":"ping","payload":{"value":"hello"}}"#;
+        let req: SocketRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "ping");
+        assert!(req.id.is_none());
+        assert!(req.auth_token.is_none());
+    }
+
+    #[test]
+    fn test_socket_request_with_id_and_auth() {
+        let json = r#"{"command":"get_dom","payload":{},"id":"req-123","authToken":"secret"}"#;
+        let req: SocketRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "get_dom");
+        assert_eq!(req.id.as_deref(), Some("req-123"));
+        assert_eq!(req.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_socket_response_serialization_success() {
+        let resp = SocketResponse {
+            success: true,
+            data: Some(serde_json::json!({"key": "value"})),
+            error: None,
+            id: Some("req-1".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"id\":\"req-1\""));
+        assert!(json.contains("\"error\":null"));
+    }
+
+    #[test]
+    fn test_socket_response_serialization_error() {
+        let resp = SocketResponse {
+            success: false,
+            data: None,
+            error: Some("something failed".to_string()),
+            id: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("something failed"));
+    }
+
+    #[test]
+    fn test_auth_token_matching() {
+        let expected: Arc<str> = Arc::from("my-secret-token");
+        let provided = "my-secret-token";
+        assert_eq!(provided, expected.as_ref());
+
+        let wrong = "wrong-token";
+        assert_ne!(wrong, expected.as_ref());
+    }
 }
