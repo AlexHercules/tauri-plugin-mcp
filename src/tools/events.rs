@@ -80,7 +80,7 @@ pub async fn handle_manage_events<R: Runtime>(
             tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms)).await;
             app.unlisten(handler);
 
-            let events = collected.lock().unwrap().clone();
+            let events = collected.lock().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(SocketResponse {
                 success: true,
                 data: Some(serde_json::json!({
@@ -117,7 +117,7 @@ pub async fn handle_manage_events<R: Runtime>(
             tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms)).await;
             app.unlisten(handler);
 
-            let events = collected.lock().unwrap().clone();
+            let events = collected.lock().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(SocketResponse {
                 success: true,
                 data: Some(serde_json::json!({

@@ -596,19 +596,23 @@ interface PageMapResult {
 // Wait for DOM mutations to settle (no changes for `quietMs` milliseconds)
 function waitForDomStable(quietMs: number = 300, maxWaitMs: number = 3000): Promise<void> {
     return new Promise((resolve) => {
+        let resolved = false;
         let timer: ReturnType<typeof setTimeout>;
-        const timeout = setTimeout(() => {
+
+        function done() {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            clearTimeout(timeout);
             observer.disconnect();
             resolve();
-        }, maxWaitMs);
+        }
+
+        const timeout = setTimeout(done, maxWaitMs);
 
         const observer = new MutationObserver(() => {
             clearTimeout(timer);
-            timer = setTimeout(() => {
-                observer.disconnect();
-                clearTimeout(timeout);
-                resolve();
-            }, quietMs);
+            timer = setTimeout(done, quietMs);
         });
 
         observer.observe(document.body || document.documentElement, {
@@ -619,11 +623,7 @@ function waitForDomStable(quietMs: number = 300, maxWaitMs: number = 3000): Prom
         });
 
         // If no mutations happen at all, resolve after quietMs
-        timer = setTimeout(() => {
-            observer.disconnect();
-            clearTimeout(timeout);
-            resolve();
-        }, quietMs);
+        timer = setTimeout(done, quietMs);
     });
 }
 
@@ -1507,7 +1507,7 @@ async function handleSendTextToElementRequest(event: any) {
             
             // Check if it's a specific type of editor
             const isLexicalEditor = element.hasAttribute('data-lexical-editor');
-            const isSlateEditor = element.querySelector('[data-slate-editor="true"]') !== null;
+            const isSlateEditor = element.hasAttribute('data-slate-editor') || element.querySelector('[data-slate-editor="true"]') !== null;
             
             if (isLexicalEditor) {
                 console.log('TAURI-PLUGIN-MCP: Detected Lexical editor, using specialized handling');

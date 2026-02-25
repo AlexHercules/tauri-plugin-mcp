@@ -707,7 +707,7 @@ pub async fn handle_wait_for<R: Runtime>(
     });
 
     // Rust timeout = JS timeout + 2s buffer
-    let rust_timeout_secs = (timeout_ms / 1000) + 2;
+    let rust_timeout_secs = (timeout_ms + 2000) / 1000;
 
     match emit_and_wait(
         app,
