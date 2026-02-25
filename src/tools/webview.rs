@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::mpsc;
 use tauri::{AppHandle, Emitter, Listener, Runtime};
 use uuid::Uuid;
 
@@ -14,9 +13,9 @@ use crate::desktop::get_emit_target;
 /// 2. Injects `_correlationId` into the JSON payload sent to JS.
 /// 3. Registers a one-shot listener on `"{response_event}-{uuid}"` BEFORE emitting.
 /// 4. Emits `request_event` with the augmented payload.
-/// 5. Waits up to `timeout` for the JS side to respond on the correlated event.
+/// 5. Awaits up to `timeout` for the JS side to respond on the correlated event.
 /// 6. Returns the raw payload string, or an error on timeout / emit failure.
-pub fn emit_and_wait<R: Runtime>(
+pub async fn emit_and_wait<R: Runtime>(
     app: &AppHandle<R>,
     emit_target: &str,
     request_event: &str,
@@ -40,7 +39,7 @@ pub fn emit_and_wait<R: Runtime>(
         });
     }
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
 
     // Register correlated listener BEFORE emitting (avoids race condition)
     let correlated_event = format!("{}-{}", response_event, correlation_id);
@@ -57,14 +56,24 @@ pub fn emit_and_wait<R: Runtime>(
         )));
     }
 
-    // Wait for the correlated response
-    rx.recv_timeout(timeout).map_err(|e| {
-        app.unlisten(listener_id);
-        crate::error::Error::Anyhow(format!(
-            "Timeout waiting for {} response: {}",
-            request_event, e
-        ))
-    })
+    // Await the correlated response with timeout
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(payload)) => Ok(payload),
+        Ok(Err(_)) => {
+            // Sender dropped without sending (listener was cleaned up)
+            Err(crate::error::Error::Anyhow(format!(
+                "Listener dropped before {} response received",
+                request_event
+            )))
+        }
+        Err(_) => {
+            app.unlisten(listener_id);
+            Err(crate::error::Error::Anyhow(format!(
+                "Timeout waiting for {} response",
+                request_event
+            )))
+        }
+    }
 }
 
 // ---- Parse / extract helpers ----
@@ -160,7 +169,7 @@ pub async fn handle_get_dom<R: Runtime>(
         "got-dom-content-response",
         serde_json::json!("test"),
         std::time::Duration::from_secs(timeout_secs),
-    ) {
+    ).await {
         Ok(dom_string) => {
             if dom_string.is_empty() {
                 Ok(crate::socket_server::SocketResponse {
@@ -216,7 +225,8 @@ pub async fn handle_get_page_map<R: Runtime>(
         "interactiveOnly": payload.get("interactive_only").and_then(|v| v.as_bool()).unwrap_or(false),
         "scopeSelector": payload.get("scope_selector"),
         "maxDepth": payload.get("max_depth").and_then(|v| v.as_u64()),
-        "delta": payload.get("delta").and_then(|v| v.as_bool()).unwrap_or(false)
+        "delta": payload.get("delta").and_then(|v| v.as_bool()).unwrap_or(false),
+        "includeMetadata": payload.get("include_metadata").and_then(|v| v.as_bool()).unwrap_or(true)
     });
 
     match emit_and_wait(
@@ -226,7 +236,7 @@ pub async fn handle_get_page_map<R: Runtime>(
         "get-page-map-response",
         js_payload,
         std::time::Duration::from_secs(timeout_secs),
-    ) {
+    ).await {
         Ok(result_string) => {
             if result_string.is_empty() || result_string == "\"\"" {
                 return Ok(crate::socket_server::SocketResponse {
@@ -321,7 +331,7 @@ pub async fn handle_get_element_position<R: Runtime>(
         "get-element-position-response",
         js_payload,
         std::time::Duration::from_secs(5),
-    ) {
+    ).await {
         Ok(result) => {
             let result_value: Value = serde_json::from_str(&result).map_err(|e| {
                 crate::error::Error::Anyhow(format!("Failed to parse result: {}", e))
@@ -400,7 +410,7 @@ pub async fn handle_send_text_to_element<R: Runtime>(
         "send-text-to-element-response",
         js_payload,
         std::time::Duration::from_secs(30),
-    ) {
+    ).await {
         Ok(result) => {
             let result_value: Value = serde_json::from_str(&result).map_err(|e| {
                 crate::error::Error::Anyhow(format!("Failed to parse result: {}", e))
@@ -460,7 +470,7 @@ pub async fn handle_get_page_state<R: Runtime>(
         "get-page-state-response",
         serde_json::json!({}),
         std::time::Duration::from_secs(5),
-    ) {
+    ).await {
         Ok(result) => Ok(parse_js_response(&result)),
         Err(e) => Ok(crate::socket_server::SocketResponse {
             success: false,
@@ -495,7 +505,7 @@ pub async fn handle_navigate_back<R: Runtime>(
         "navigate-back-response",
         js_payload,
         std::time::Duration::from_secs(5),
-    ) {
+    ).await {
         Ok(result) => Ok(parse_js_response(&result)),
         Err(e) => Ok(crate::socket_server::SocketResponse {
             success: false,
@@ -533,7 +543,7 @@ pub async fn handle_scroll_page<R: Runtime>(
         "scroll-page-response",
         js_payload,
         std::time::Duration::from_secs(5),
-    ) {
+    ).await {
         Ok(result) => Ok(parse_js_response(&result)),
         Err(e) => Ok(crate::socket_server::SocketResponse {
             success: false,
@@ -586,12 +596,86 @@ pub async fn handle_fill_form<R: Runtime>(
         "fill-form-response",
         js_payload,
         std::time::Duration::from_secs(30),
-    ) {
+    ).await {
         Ok(result) => Ok(parse_js_response(&result)),
         Err(e) => Ok(crate::socket_server::SocketResponse {
             success: false,
             data: None,
             error: Some(format!("Timeout waiting for form fill: {}", e)),
+            id: None,
+        }),
+    }
+}
+
+/// Handler for type_into_focused — JS-based typing into the currently focused element
+/// Detects element type (input/textarea, Lexical, Slate, contentEditable) and routes
+/// to the appropriate JS typing strategy. Solves Lexical/Slate failures with native
+/// NSEvent injection by using DOM-level event dispatch instead.
+pub async fn handle_type_into_focused<R: Runtime>(
+    app: &AppHandle<R>,
+    payload: Value,
+) -> Result<crate::socket_server::SocketResponse, crate::error::Error> {
+    let window_label = payload
+        .get("window_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main")
+        .to_string();
+
+    let _webview = crate::desktop::get_webview_for_eval(app, &window_label).ok_or_else(|| {
+        crate::error::Error::Anyhow(format!("Webview not found: {}", window_label))
+    })?;
+
+    let emit_target = get_emit_target(app, &window_label);
+
+    let text = payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if text.is_empty() {
+        return Ok(crate::socket_server::SocketResponse {
+            success: false,
+            data: None,
+            error: Some("text parameter is required and must not be empty".to_string()),
+            id: None,
+        });
+    }
+
+    let delay_ms = payload
+        .get("delay_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20);
+
+    let mut js_payload = serde_json::json!({
+        "text": text,
+        "delayMs": delay_ms
+    });
+    if let Some(initial_delay) = payload.get("initial_delay_ms").and_then(|v| v.as_u64()) {
+        js_payload["initialDelayMs"] = serde_json::json!(initial_delay);
+    }
+
+    let initial_delay_ms = payload
+        .get("initial_delay_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // Allow generous timeout for character-by-character typing + initial delay
+    let timeout_secs = std::cmp::max(10, (text.len() as u64 * delay_ms + initial_delay_ms) / 1000 + 5);
+
+    match emit_and_wait(
+        app,
+        &emit_target,
+        "type-into-focused",
+        "type-into-focused-response",
+        js_payload,
+        std::time::Duration::from_secs(timeout_secs),
+    ).await {
+        Ok(result) => Ok(parse_js_response(&result)),
+        Err(e) => Ok(crate::socket_server::SocketResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Timeout waiting for type_into_focused: {}", e)),
             id: None,
         }),
     }
@@ -632,7 +716,7 @@ pub async fn handle_wait_for<R: Runtime>(
         "wait-for-response",
         js_payload,
         std::time::Duration::from_secs(rust_timeout_secs),
-    ) {
+    ).await {
         Ok(result) => Ok(parse_js_response(&result)),
         Err(e) => Ok(crate::socket_server::SocketResponse {
             success: false,

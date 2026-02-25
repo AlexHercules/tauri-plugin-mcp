@@ -1,3 +1,60 @@
+// --- addEventListener monkey-patch for interactive listener detection ---
+// Must run BEFORE any framework (React/Vue/Svelte) mounts, so placed at very top.
+// Tracks by callback identity (type + listener + capture) so removeEventListener
+// with a non-matching handler doesn't incorrectly remove elements from the set.
+const _elementsWithListeners = new WeakSet<Element>();
+const INTERACTIVE_LISTENER_TYPES = new Set([
+    'click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup',
+    'touchstart', 'touchend', 'keydown', 'keyup', 'keypress'
+]);
+
+if (typeof window !== 'undefined' && !(window as any).__TAURI_MCP_LISTENER_PATCH__) {
+    const _origAdd = EventTarget.prototype.addEventListener;
+    const _origRemove = EventTarget.prototype.removeEventListener;
+    // Map<Element, Map<"type|capture", Set<listener>>>
+    const _listenerSets = new WeakMap<Element, Map<string, Set<any>>>();
+
+    function _captureFlag(options: any): boolean {
+        if (typeof options === 'boolean') return options;
+        if (options && typeof options === 'object') return !!options.capture;
+        return false;
+    }
+
+    EventTarget.prototype.addEventListener = function(type: string, listener: any, options?: any) {
+        if (INTERACTIVE_LISTENER_TYPES.has(type) && this instanceof Element && listener) {
+            const key = `${type}|${_captureFlag(options) ? '1' : '0'}`;
+            let map = _listenerSets.get(this);
+            if (!map) { map = new Map(); _listenerSets.set(this, map); }
+            let set = map.get(key);
+            if (!set) { set = new Set(); map.set(key, set); }
+            set.add(listener);
+            _elementsWithListeners.add(this);
+        }
+        return _origAdd.call(this, type, listener, options);
+    };
+
+    EventTarget.prototype.removeEventListener = function(type: string, listener: any, options?: any) {
+        if (INTERACTIVE_LISTENER_TYPES.has(type) && this instanceof Element && listener) {
+            const map = _listenerSets.get(this);
+            if (map) {
+                const key = `${type}|${_captureFlag(options) ? '1' : '0'}`;
+                const set = map.get(key);
+                if (set) {
+                    set.delete(listener);
+                    if (set.size === 0) map.delete(key);
+                }
+                if (map.size === 0) {
+                    _elementsWithListeners.delete(this);
+                    _listenerSets.delete(this);
+                }
+            }
+        }
+        return _origRemove.call(this, type, listener, options);
+    };
+
+    (window as any).__TAURI_MCP_LISTENER_PATCH__ = true;
+}
+
 import { emit } from '@tauri-apps/api/event'; // For emitting the response
 import { getCurrentWebviewWindow, WebviewWindow } from '@tauri-apps/api/webviewWindow'; // For window-specific listener
 
@@ -15,6 +72,7 @@ let fillFormUnlistenFunction: (() => void) | null = null;
 let waitForUnlistenFunction: (() => void) | null = null;
 let navigateWebviewUnlistenFunction: (() => void) | null = null;
 let manageZoomUnlistenFunction: (() => void) | null = null;
+let typeIntoFocusedUnlistenFunction: (() => void) | null = null;
 
 // ---- Correlation ID helpers ----
 // Extract the _correlationId from an event payload (injected by Rust's emit_and_wait).
@@ -38,11 +96,43 @@ async function emitResponse(baseEventName: string, correlationId: string | null,
 // Global ref map: stores numbered references to interactive elements from the last getPageMap call
 let _pageMapRefElements: Map<number, Element> = new Map();
 
+// Track the last focused element for cross-call focus persistence
+let _lastFocusedElement: Element | null = null;
+
+// Returns true if an element can accept typed text input
+function isTypeable(el: Element): boolean {
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el instanceof HTMLElement && el.isContentEditable) return true;
+    if (el.hasAttribute('data-lexical-editor') || el.hasAttribute('data-slate-editor')) return true;
+    if (el.closest('[data-lexical-editor]') || el.closest('[data-slate-editor]')) return true;
+    return false;
+}
+
+// Set up a capture-phase focus listener to track the last focused typeable element
+if (typeof document !== 'undefined') {
+    document.addEventListener('focus', (e) => {
+        const target = e.target;
+        if (target && target instanceof Element && isTypeable(target)) {
+            _lastFocusedElement = target;
+        }
+    }, true);
+}
+
 // Delta tracking: fingerprint → { ref, props } from the previous getPageMap(delta:true) call
 let _previousPageMapFingerprints: Map<string, { ref: number; props: PageMapElement }> = new Map();
 let _previousPageMapMaxRef: number = 0;
 
-export async function setupPluginListeners() { 
+// Deduplication: track correlation IDs that have already been handled to prevent
+// duplicate processing when listeners are accidentally registered twice
+// (React StrictMode, HMR, SPA navigation)
+const _handledCorrelationIds = new Set<string>();
+
+export async function setupPluginListeners() {
+    // Clean up any existing listeners to prevent duplicate registration
+    // (can happen with React StrictMode, HMR, or SPA navigation)
+    await cleanupPluginListeners();
+
     const currentWindow: WebviewWindow = getCurrentWebviewWindow();
     domContentUnlistenFunction = await currentWindow.listen('got-dom-content', handleDomContentRequest);
     pageMapUnlistenFunction = await currentWindow.listen('get-page-map', handleGetPageMapRequest);
@@ -57,6 +147,7 @@ export async function setupPluginListeners() {
     waitForUnlistenFunction = await currentWindow.listen('wait-for', handleWaitForRequest);
     navigateWebviewUnlistenFunction = await currentWindow.listen('navigate-webview', handleNavigateWebviewRequest);
     manageZoomUnlistenFunction = await currentWindow.listen('manage-zoom', handleManageZoomRequest);
+    typeIntoFocusedUnlistenFunction = await currentWindow.listen('type-into-focused', handleTypeIntoFocusedRequest);
 
     console.log('TAURI-PLUGIN-MCP: All event listeners are set up on the current window.');
 }
@@ -123,6 +214,10 @@ export async function cleanupPluginListeners() {
     if (manageZoomUnlistenFunction) {
         manageZoomUnlistenFunction();
         manageZoomUnlistenFunction = null;
+    }
+    if (typeIntoFocusedUnlistenFunction) {
+        typeIntoFocusedUnlistenFunction();
+        typeIntoFocusedUnlistenFunction = null;
     }
     console.log('TAURI-PLUGIN-MCP: All event listeners have been removed.');
 }
@@ -351,6 +446,21 @@ function findElementByText(text: string): Element | null {
 // Helper function to click an element
 function clickElement(element: Element, centerX: number, centerY: number) {
     try {
+        // Explicitly focus the element before dispatching mouse events.
+        // Synthetic dispatchEvent() does NOT trigger the browser's native focus
+        // behavior the way a real user click does. Without this, document.activeElement
+        // stays on <body> and the type_into_focused handler can't find the target.
+        if (element instanceof HTMLElement) {
+            element.focus();
+        }
+
+        // Update _lastFocusedElement so type_into_focused can recover focus
+        // even if the app's click handler shifts focus elsewhere (e.g. closes
+        // a dropdown, re-renders a component).
+        if (isTypeable(element)) {
+            _lastFocusedElement = element;
+        }
+
         // Create and dispatch mouse events
         const mouseDown = new MouseEvent('mousedown', {
             bubbles: true,
@@ -359,7 +469,7 @@ function clickElement(element: Element, centerX: number, centerY: number) {
             clientX: centerX,
             clientY: centerY
         });
-        
+
         const mouseUp = new MouseEvent('mouseup', {
             bubbles: true,
             cancelable: true,
@@ -367,7 +477,7 @@ function clickElement(element: Element, centerX: number, centerY: number) {
             clientX: centerX,
             clientY: centerY
         });
-        
+
         const click = new MouseEvent('click', {
             bubbles: true,
             cancelable: true,
@@ -375,12 +485,12 @@ function clickElement(element: Element, centerX: number, centerY: number) {
             clientX: centerX,
             clientY: centerY
         });
-        
+
         // Dispatch the events
         element.dispatchEvent(mouseDown);
         element.dispatchEvent(mouseUp);
         element.dispatchEvent(click);
-        
+
         return {
             success: true,
             elementTag: element.tagName,
@@ -427,6 +537,7 @@ function getDomContent(): string {
 interface PageMapElement {
     ref: number;
     tag: string;
+    interactive?: boolean;
     type?: string;
     text?: string;
     placeholder?: string;
@@ -439,10 +550,16 @@ interface PageMapElement {
     checked?: boolean;
     disabled?: boolean;
     options?: string[];
+    context?: string;
+    parentRef?: number;
+    depth?: number;
+    /** False when the element or an ancestor is hidden (display:none, aria-hidden, etc.) */
+    visible?: boolean;
 }
 
 interface PageMapOptions {
     includeContent?: boolean;
+    includeMetadata?: boolean;
     interactiveOnly?: boolean;
     scopeSelector?: string | string[];
     maxDepth?: number;
@@ -458,12 +575,19 @@ interface PageMapDelta {
     changed: number[];
 }
 
+interface PageMetadata {
+    description?: string;
+    openGraph?: Record<string, string>;
+    jsonLd?: any[];
+}
+
 interface PageMapResult {
     url: string;
     title: string;
     viewport: { width: number; height: number };
     elements: PageMapElement[];
     content: string;
+    metadata?: PageMetadata;
     scope?: string | string[];
     maxDepth?: number;
     delta?: PageMapDelta;
@@ -551,12 +675,61 @@ const INTERACTIVE_ROLES = new Set([
     'searchbox'
 ]);
 
+const SEMANTIC_TAGS = new Set([
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'IMG', 'NAV', 'MAIN', 'HEADER', 'FOOTER', 'ASIDE',
+    'SECTION', 'ARTICLE', 'FIGURE', 'FIGCAPTION',
+    'TABLE', 'FORM', 'LABEL', 'FIELDSET', 'LEGEND',
+    'P', 'LI', 'OL', 'UL', 'DL', 'DT', 'DD',
+]);
+
 function isElementVisible(el: Element): boolean {
     if (!(el instanceof HTMLElement)) return true;
+
+    // Attribute-level hiding
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.hidden) return false;
+
     const style = window.getComputedStyle(el);
+
+    // Standard CSS hiding
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) return false;
+
+    // Overflow hidden with tiny dimensions (common sr-only pattern)
+    if (style.overflow === 'hidden' && (rect.width <= 1 || rect.height <= 1)) return false;
+
+    // clip: rect(0,0,0,0) or similar zero-area clip
+    const clip = style.getPropertyValue('clip');
+    if (clip && clip !== 'auto') {
+        const m = clip.match(/rect\(\s*([^\s,]+)[\s,]+([^\s,]+)[\s,]+([^\s,]+)[\s,]+([^\s,]+)\s*\)/);
+        if (m) {
+            const [, top, right, bottom, left] = m.map(v => parseFloat(v) || 0);
+            if (top === bottom && left === right) return false;
+        }
+    }
+
+    // clip-path: inset(50%) or higher — hides the element
+    const clipPath = style.getPropertyValue('clip-path');
+    if (clipPath) {
+        const insetMatch = clipPath.match(/inset\(\s*([\d.]+)(%|px)?\s*\)/);
+        if (insetMatch) {
+            const val = parseFloat(insetMatch[1]);
+            const unit = insetMatch[2] || '%';
+            if ((unit === '%' && val >= 50) || (unit === 'px' && val >= Math.min(rect.width, rect.height) / 2)) return false;
+        }
+    }
+
+    // Off-screen positioning (common sr-only: position:absolute; left:-9999px)
+    const position = style.position;
+    if (position === 'absolute' || position === 'fixed') {
+        const left = parseFloat(style.left);
+        const top = parseFloat(style.top);
+        if ((!isNaN(left) && left <= -9000) || (!isNaN(top) && top <= -9000)) return false;
+    }
+
     return true;
 }
 
@@ -567,7 +740,51 @@ function isInteractive(el: Element): boolean {
     if (el instanceof HTMLElement && el.isContentEditable) return true;
     if (el.getAttribute('tabindex') !== null && el.getAttribute('tabindex') !== '-1') return true;
     if (el.getAttribute('onclick') || el.getAttribute('ng-click') || el.getAttribute('@click')) return true;
+    // Detect elements with programmatic event listeners (React/Vue/Svelte)
+    if (_elementsWithListeners.has(el)) return true;
+    // Also check the vanilla JS backup patch (injected via on_page_load before this module loads)
+    if ((window as any).__TAURI_MCP_ELEMENTS_WITH_LISTENERS__?.has(el)) return true;
     return false;
+}
+
+function isSemanticElement(el: Element): boolean {
+    if (SEMANTIC_TAGS.has(el.tagName)) return true;
+    if (el.getAttribute('role')) return true;
+    if (el.getAttribute('aria-label')) return true;
+    if (el.getAttribute('data-testid') || el.id) return true;
+    return false;
+}
+
+// --- Hierarchy / context tracking ---
+
+const CONTEXT_TAGS = new Set([
+    'NAV', 'MAIN', 'HEADER', 'FOOTER', 'ASIDE', 'SECTION', 'ARTICLE',
+    'FORM', 'DIALOG', 'DETAILS', 'FIELDSET', 'FIGURE', 'TABLE'
+]);
+
+const LANDMARK_ROLES: Record<string, string> = {
+    navigation: 'nav', main: 'main', banner: 'header', contentinfo: 'footer',
+    complementary: 'aside', search: 'search', form: 'form', region: 'region', dialog: 'dialog'
+};
+
+function isContextElement(el: Element): boolean {
+    if (CONTEXT_TAGS.has(el.tagName)) return true;
+    const role = el.getAttribute('role');
+    return !!(role && LANDMARK_ROLES[role]);
+}
+
+function buildContextLabel(el: Element): string {
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute('role');
+    let label = role && LANDMARK_ROLES[role] ? `[role=${role}]` : tag;
+    if (el.id) label += `#${el.id}`;
+    else {
+        const cls = el.className;
+        if (typeof cls === 'string' && cls.trim()) {
+            label += `.${cls.trim().split(/\s+/)[0]}`;
+        }
+    }
+    return label;
 }
 
 function getElementText(el: Element): string {
@@ -582,15 +799,12 @@ function getElementText(el: Element): string {
     if (el instanceof HTMLSelectElement) {
         return el.options[el.selectedIndex]?.text || '';
     }
-    // For other elements, get direct text (not children's text)
+    // For other elements, use innerText (respects visibility, includes nested text)
     let text = '';
-    for (const node of el.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) {
-            text += node.textContent || '';
-        }
+    if (el instanceof HTMLElement) {
+        text = (el.innerText || '').trim();
     }
-    text = text.trim();
-    // If no direct text, fall back to aria-label or title
+    // If no visible text, fall back to aria-label or title
     if (!text) {
         text = el.getAttribute('aria-label') || el.getAttribute('title') || '';
     }
@@ -608,12 +822,119 @@ function elementFingerprint(el: Element): string {
     const name = (el as HTMLInputElement).name || '';
     const type = (el as HTMLInputElement).type || '';
     const href = (el as HTMLAnchorElement).href || '';
-    return `${tag}|${id}|${name}|${type}|${href}`;
+    const text50 = (el.textContent || '').trim().substring(0, 50);
+    const class50 = (typeof el.className === 'string' ? el.className : '').substring(0, 50);
+    // Sibling index for positional disambiguation
+    let nthChild = 0;
+    if (el.parentElement) {
+        const siblings = el.parentElement.children;
+        for (let i = 0; i < siblings.length; i++) {
+            if (siblings[i] === el) { nthChild = i; break; }
+        }
+    }
+    return `${tag}|${id}|${name}|${type}|${href}|${text50}|${class50}|${nthChild}`;
+}
+
+// Build a PageMapElement from a DOM element, or return null if it doesn't qualify
+function buildPageMapEntry(el: Element, interactiveOnly: boolean): PageMapElement | null {
+    const interactive = isInteractive(el);
+    if (!interactive && (interactiveOnly || !isSemanticElement(el))) return null;
+
+    const entry: PageMapElement = {
+        ref: 0,
+        tag: el.tagName.toLowerCase(),
+    };
+
+    // Mark non-interactive elements explicitly
+    if (!interactive) entry.interactive = false;
+
+    // Type for inputs
+    if (el instanceof HTMLInputElement) {
+        entry.type = el.type;
+        if (el.value) entry.value = el.value.substring(0, 100);
+        if (el.placeholder) entry.placeholder = el.placeholder;
+        if (el.name) entry.name = el.name;
+        if (el.type === 'checkbox' || el.type === 'radio') {
+            entry.checked = el.checked;
+        }
+        if (el.disabled) entry.disabled = true;
+    } else if (el instanceof HTMLTextAreaElement) {
+        entry.type = 'textarea';
+        if (el.value) entry.value = el.value.substring(0, 100);
+        if (el.placeholder) entry.placeholder = el.placeholder;
+        if (el.name) entry.name = el.name;
+        if (el.disabled) entry.disabled = true;
+    } else if (el instanceof HTMLSelectElement) {
+        entry.type = 'select';
+        entry.options = Array.from(el.options).map(o => o.text).slice(0, 10);
+        if (el.name) entry.name = el.name;
+        if (el.disabled) entry.disabled = true;
+    } else if (el instanceof HTMLAnchorElement) {
+        entry.href = el.href;
+    } else if (el instanceof HTMLImageElement) {
+        if (el.alt) entry.text = el.alt;
+    }
+
+    const text = getElementText(el);
+    if (text) entry.text = text;
+
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel && ariaLabel !== text) entry.ariaLabel = ariaLabel;
+
+    const role = el.getAttribute('role');
+    if (role) entry.role = role;
+
+    if (el.id) entry.id = el.id;
+
+    return entry;
+}
+
+// --- Structured metadata extraction ---
+
+function extractPageMetadata(): PageMetadata {
+    const metadata: PageMetadata = {};
+
+    // <meta name="description">
+    const descMeta = document.querySelector('meta[name="description"]');
+    if (descMeta) {
+        const content = descMeta.getAttribute('content');
+        if (content) metadata.description = content;
+    }
+
+    // OpenGraph meta tags: <meta property="og:*">
+    const ogTags = document.querySelectorAll('meta[property^="og:"]');
+    if (ogTags.length > 0) {
+        const og: Record<string, string> = {};
+        ogTags.forEach(tag => {
+            const prop = tag.getAttribute('property');
+            const content = tag.getAttribute('content');
+            if (prop && content) og[prop] = content;
+        });
+        if (Object.keys(og).length > 0) metadata.openGraph = og;
+    }
+
+    // JSON-LD: <script type="application/ld+json">
+    const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
+    if (jsonLdScripts.length > 0) {
+        const jsonLd: any[] = [];
+        jsonLdScripts.forEach(script => {
+            try {
+                const parsed = JSON.parse(script.textContent || '');
+                jsonLd.push(parsed);
+            } catch {
+                // Skip malformed JSON-LD
+            }
+        });
+        if (jsonLd.length > 0) metadata.jsonLd = jsonLd;
+    }
+
+    return metadata;
 }
 
 function getPageMap(options?: PageMapOptions): PageMapResult {
     const interactiveOnly = options?.interactiveOnly === true;
     const includeContent = interactiveOnly ? false : (options?.includeContent !== false);
+    const includeMetadata = options?.includeMetadata !== false;
     const maxDepth = typeof options?.maxDepth === 'number' ? options.maxDepth : Infinity;
     const isDelta = options?.delta === true;
     const scopeSelector = options?.scopeSelector;
@@ -624,8 +945,12 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
     const elements: PageMapElement[] = [];
     // In delta mode, start refs above the previous max so new elements get high refs
     let refCounter = isDelta ? _previousPageMapMaxRef + 1 : 1;
-    const contentParts: string[] = [];
     const seenTexts = new Set<string>();
+
+    // Content priority buckets: main content first, secondary (nav/header/footer) fills remaining budget
+    const SECONDARY_CONTEXT_TAGS = new Set(['NAV', 'FOOTER', 'ASIDE', 'HEADER']);
+    const mainContentParts: string[] = [];
+    const secondaryContentParts: string[] = [];
 
     // Track fingerprints for this call (used by delta mode)
     const currentFingerprints: Map<string, { ref: number; props: PageMapElement }> = new Map();
@@ -652,17 +977,39 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
         return ref;
     }
 
-    function walkNode(node: Node, depth: number) {
+    // Determine content bucket based on context stack
+    function isSecondaryContext(contextStack: string[]): boolean {
+        for (const ctx of contextStack) {
+            // Check if any context tag in the stack is a secondary region
+            for (const tag of SECONDARY_CONTEXT_TAGS) {
+                if (ctx.toLowerCase().startsWith(tag.toLowerCase()) || ctx.startsWith(`[role=${tag.toLowerCase()}`)) return true;
+            }
+        }
+        return false;
+    }
+
+    // Track walk stats for diagnostics
+    let nodesVisited = 0;
+
+    function walkNode(node: Node, depth: number, contextStack: string[], parentRefNum: number | null, hiddenAncestor: boolean = false) {
+        nodesVisited++;
         // Depth guard: stop recursing deeper than maxDepth
         if (depth > maxDepth) return;
 
         if (node.nodeType === Node.TEXT_NODE) {
             // In interactive-only mode, skip all text collection
             if (interactiveOnly) return;
+            // Skip text inside hidden subtrees — don't pollute aggregated content
+            if (hiddenAncestor) return;
             const text = (node.textContent || '').trim();
             if (includeContent && text && !seenTexts.has(text)) {
                 seenTexts.add(text);
-                contentParts.push(text);
+                // Route to priority bucket
+                if (isSecondaryContext(contextStack)) {
+                    secondaryContentParts.push(text);
+                } else {
+                    mainContentParts.push(text);
+                }
             }
             return;
         }
@@ -674,16 +1021,21 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
         if (NOISE_TAGS.has(el.tagName)) return;
 
         // Skip SVG internals (keep the top-level <svg> but skip its children)
-        if (el.tagName === 'SVG' || el.closest('svg')) {
-            // If this is the <svg> itself, check for aria-label
-            if (el.tagName === 'svg' || el.tagName === 'SVG') {
+        // Normalize tagName for SVG namespace (can be mixed case)
+        const tagUpper = el.tagName.toUpperCase();
+        const isSvgNamespace = el.namespaceURI === 'http://www.w3.org/2000/svg';
+        if (tagUpper === 'SVG' || (isSvgNamespace && tagUpper !== 'SVG')) {
+            if (tagUpper === 'SVG') {
                 const label = el.getAttribute('aria-label');
                 if (label && isElementVisible(el)) {
                     const entry: PageMapElement = {
                         ref: 0,
                         tag: 'svg',
-                        ariaLabel: label
+                        ariaLabel: label,
+                        depth,
                     };
+                    if (contextStack.length > 0) entry.context = contextStack.join(' > ');
+                    if (parentRefNum !== null) entry.parentRef = parentRefNum;
                     assignRef(el, entry);
                     elements.push(entry);
                 }
@@ -691,59 +1043,47 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
             return;
         }
 
-        // Skip hidden elements
-        if (!isElementVisible(el)) return;
-
-        // Check if interactive
-        if (isInteractive(el)) {
-            const entry: PageMapElement = {
-                ref: 0,
-                tag: el.tagName.toLowerCase(),
-            };
-
-            // Type for inputs
-            if (el instanceof HTMLInputElement) {
-                entry.type = el.type;
-                if (el.value) entry.value = el.value.substring(0, 100);
-                if (el.placeholder) entry.placeholder = el.placeholder;
-                if (el.name) entry.name = el.name;
-                if (el.type === 'checkbox' || el.type === 'radio') {
-                    entry.checked = el.checked;
-                }
-                if (el.disabled) entry.disabled = true;
-            } else if (el instanceof HTMLTextAreaElement) {
-                entry.type = 'textarea';
-                if (el.value) entry.value = el.value.substring(0, 100);
-                if (el.placeholder) entry.placeholder = el.placeholder;
-                if (el.name) entry.name = el.name;
-                if (el.disabled) entry.disabled = true;
-            } else if (el instanceof HTMLSelectElement) {
-                entry.type = 'select';
-                entry.options = Array.from(el.options).map(o => o.text).slice(0, 10);
-                if (el.name) entry.name = el.name;
-                if (el.disabled) entry.disabled = true;
-            } else if (el instanceof HTMLAnchorElement) {
-                entry.href = el.href;
-            }
-
-            const text = getElementText(el);
-            if (text) entry.text = text;
-
-            const ariaLabel = el.getAttribute('aria-label');
-            if (ariaLabel && ariaLabel !== text) entry.ariaLabel = ariaLabel;
-
-            const role = el.getAttribute('role');
-            if (role) entry.role = role;
-
-            if (el.id) entry.id = el.id;
-
-            assignRef(el, entry);
-            elements.push(entry);
+        // Update context stack if this is a context element
+        let newContextStack = contextStack;
+        if (isContextElement(el)) {
+            newContextStack = [...contextStack, buildContextLabel(el)];
         }
 
-        // Walk children
+        // Check element visibility — propagate hidden state to descendants
+        const selfVisible = isElementVisible(el);
+        const isHidden = hiddenAncestor || !selfVisible;
+
+        let currentParentRef = parentRefNum;
+        if (selfVisible && !hiddenAncestor) {
+            // Fully visible element — emit normally
+            const entry = buildPageMapEntry(el, interactiveOnly);
+            if (entry) {
+                entry.depth = depth;
+                if (newContextStack.length > 0) entry.context = newContextStack.join(' > ');
+                if (parentRefNum !== null) entry.parentRef = parentRefNum;
+
+                assignRef(el, entry);
+                elements.push(entry);
+                currentParentRef = entry.ref;
+            }
+        } else {
+            // Hidden element or inside hidden ancestor — still emit but flag as not visible
+            const entry = buildPageMapEntry(el, interactiveOnly);
+            if (entry) {
+                entry.depth = depth;
+                entry.visible = false;
+                if (newContextStack.length > 0) entry.context = newContextStack.join(' > ');
+                if (parentRefNum !== null) entry.parentRef = parentRefNum;
+
+                assignRef(el, entry);
+                elements.push(entry);
+                currentParentRef = entry.ref;
+            }
+        }
+
+        // Always walk children (even of hidden wrappers) so we don't miss content
         for (const child of el.childNodes) {
-            walkNode(child, depth + 1);
+            walkNode(child, depth + 1, newContextStack, currentParentRef, isHidden);
         }
     }
 
@@ -760,7 +1100,48 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
         roots.push(document.body || document.documentElement);
     }
     for (const root of roots) {
-        walkNode(root, 0);
+        walkNode(root, 0, [], null);
+    }
+
+    // Fallback: if recursive walk found nothing, try a flat querySelectorAll scan
+    if (elements.length === 0 && nodesVisited < 5) {
+        console.warn(`TAURI-PLUGIN-MCP: Recursive walk visited only ${nodesVisited} nodes. Trying flat scan fallback.`);
+        const allEls = document.querySelectorAll('body *');
+        for (const el of allEls) {
+            if (NOISE_TAGS.has(el.tagName)) continue;
+            if (el.namespaceURI === 'http://www.w3.org/2000/svg') continue;
+            if (!isElementVisible(el)) continue;
+
+            const entry = buildPageMapEntry(el, interactiveOnly);
+            if (entry) {
+                // Compute context by walking ancestors
+                const ctxParts: string[] = [];
+                let ancestor: Element | null = el.parentElement;
+                while (ancestor && ancestor !== document.body) {
+                    if (isContextElement(ancestor)) {
+                        ctxParts.unshift(buildContextLabel(ancestor));
+                    }
+                    ancestor = ancestor.parentElement;
+                }
+                if (ctxParts.length > 0) entry.context = ctxParts.join(' > ');
+
+                assignRef(el, entry);
+                elements.push(entry);
+            }
+
+            // Collect text content
+            if (!interactiveOnly && includeContent) {
+                for (const child of el.childNodes) {
+                    if (child.nodeType === Node.TEXT_NODE) {
+                        const text = (child.textContent || '').trim();
+                        if (text && !seenTexts.has(text)) {
+                            seenTexts.add(text);
+                            mainContentParts.push(text);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Delta metadata
@@ -803,13 +1184,26 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
         _previousPageMapMaxRef = 0;
     }
 
-    // Build compressed content string
+    // Build compressed content string with priority buckets
     let content = '';
     if (includeContent) {
-        content = contentParts.join(' ').replace(/\s+/g, ' ').trim();
-        // Cap content to avoid huge payloads
-        if (content.length > 5000) {
-            content = content.substring(0, 4997) + '...';
+        const mainText = mainContentParts.join(' ').replace(/\s+/g, ' ').trim();
+        const secondaryText = secondaryContentParts.join(' ').replace(/\s+/g, ' ').trim();
+        const CONTENT_BUDGET = 5000;
+
+        if (mainText.length >= CONTENT_BUDGET) {
+            content = mainText.substring(0, CONTENT_BUDGET - 3) + '...';
+        } else {
+            content = mainText;
+            const remaining = CONTENT_BUDGET - content.length;
+            if (remaining > 10 && secondaryText) {
+                const sep = content ? ' ' : '';
+                if (secondaryText.length <= remaining - sep.length) {
+                    content += sep + secondaryText;
+                } else {
+                    content += sep + secondaryText.substring(0, remaining - sep.length - 3) + '...';
+                }
+            }
         }
     }
 
@@ -821,12 +1215,21 @@ function getPageMap(options?: PageMapOptions): PageMapResult {
         content,
     };
 
+    // Add structured page metadata
+    if (includeMetadata) {
+        const metadata = extractPageMetadata();
+        if (metadata.description || metadata.openGraph || metadata.jsonLd) {
+            result.metadata = metadata;
+        }
+    }
+
     // Add optional metadata
     if (scopeSelector) result.scope = scopeSelector;
     if (typeof options?.maxDepth === 'number') result.maxDepth = options.maxDepth;
     if (deltaResult) result.delta = deltaResult;
 
-    console.log(`TAURI-PLUGIN-MCP: Page map generated: ${elements.length} interactive elements, ${content.length} chars content`);
+    const interactiveCount = elements.filter(e => e.interactive !== false).length;
+    console.log(`TAURI-PLUGIN-MCP: Page map generated: ${elements.length} total elements (${interactiveCount} interactive), ${content.length} chars content, ${nodesVisited} nodes visited`);
     return result;
 }
 
@@ -1015,6 +1418,16 @@ async function handleSendTextToElementRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received send-text-to-element, payload:', event.payload);
     const correlationId = getCorrelationId(event.payload);
 
+    // Dedup guard: skip if this correlation ID was already handled
+    if (correlationId && _handledCorrelationIds.has(correlationId)) {
+        console.warn('TAURI-PLUGIN-MCP: Ignoring duplicate send-text-to-element for correlation ID:', correlationId);
+        return;
+    }
+    if (correlationId) {
+        _handledCorrelationIds.add(correlationId);
+        setTimeout(() => _handledCorrelationIds.delete(correlationId), 30000);
+    }
+
     try {
         const { selectorType, selectorValue, text, delayMs = 20 } = event.payload;
 
@@ -1139,7 +1552,7 @@ async function handleSendTextToElementRequest(event: any) {
 // input handling pipeline — React sees a genuine InputEvent and updates its
 // internal value tracker correctly. Direct element.value assignment + synthetic
 // Event('input') does NOT work because React's fiber state never registers the change.
-async function simulateReactInputTyping(element: HTMLInputElement | HTMLTextAreaElement, text: string, delayMs: number): Promise<void> {
+async function simulateReactInputTyping(element: HTMLInputElement | HTMLTextAreaElement, text: string, delayMs: number, clear: boolean = true): Promise<void> {
     console.log('TAURI-PLUGIN-MCP: Simulating typing on React component via execCommand');
 
     // Focus the element — required for execCommand to target it
@@ -1147,36 +1560,20 @@ async function simulateReactInputTyping(element: HTMLInputElement | HTMLTextArea
     await new Promise(resolve => setTimeout(resolve, 50));
 
     try {
-        // Clear existing content: select all then delete
-        element.select();
-        document.execCommand('delete', false);
-        await new Promise(resolve => setTimeout(resolve, 50));
+        // Clear existing content only when requested (default for selector mode,
+        // skipped for focused mode so typing appends at the cursor)
+        if (clear) {
+            element.select();
+            document.execCommand('delete', false);
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
 
         if (delayMs > 0) {
             // Character-by-character typing with delays
+            // Only use execCommand('insertText') — synthetic KeyboardEvents can cause
+            // duplicate character insertion in some frameworks that handle keydown events
             for (let i = 0; i < text.length; i++) {
-                const char = text[i];
-
-                // Dispatch keydown before the character is inserted
-                element.dispatchEvent(new KeyboardEvent('keydown', {
-                    key: char,
-                    code: `Key${char.toUpperCase()}`,
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true
-                }));
-
-                // insertText triggers a real InputEvent that React recognizes
-                document.execCommand('insertText', false, char);
-
-                // Dispatch keyup after the character is inserted
-                element.dispatchEvent(new KeyboardEvent('keyup', {
-                    key: char,
-                    code: `Key${char.toUpperCase()}`,
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true
-                }));
+                document.execCommand('insertText', false, text[i]);
 
                 if (i < text.length - 1) {
                     await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -1611,6 +2008,17 @@ function resolveElement(field: { ref?: number; selectorType?: string; selectorVa
 async function handleFillFormRequest(event: any) {
     console.log('TAURI-PLUGIN-MCP: Received fill-form, payload:', event.payload);
     const correlationId = getCorrelationId(event.payload);
+
+    // Dedup guard: skip if this correlation ID was already handled
+    if (correlationId && _handledCorrelationIds.has(correlationId)) {
+        console.warn('TAURI-PLUGIN-MCP: Ignoring duplicate fill-form for correlation ID:', correlationId);
+        return;
+    }
+    if (correlationId) {
+        _handledCorrelationIds.add(correlationId);
+        setTimeout(() => _handledCorrelationIds.delete(correlationId), 30000);
+    }
+
     try {
         const { fields, submitRef } = event.payload || {};
 
@@ -1781,6 +2189,141 @@ async function handleWaitForRequest(event: any) {
         }));
     } catch (error) {
         await emitResponse('wait-for-response', correlationId, JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : String(error)
+        }));
+    }
+}
+
+// --- type_into_focused handler ---
+// Types text into the currently focused element using JS-based strategies.
+// Detects Lexical, Slate, contentEditable, and standard inputs/textareas.
+async function handleTypeIntoFocusedRequest(event: any) {
+    console.log('TAURI-PLUGIN-MCP: Received type-into-focused, payload:', event.payload);
+    const correlationId = getCorrelationId(event.payload);
+
+    // Dedup guard: skip if this correlation ID was already handled
+    if (correlationId && _handledCorrelationIds.has(correlationId)) {
+        console.warn('TAURI-PLUGIN-MCP: Ignoring duplicate type-into-focused for correlation ID:', correlationId);
+        return;
+    }
+    if (correlationId) {
+        _handledCorrelationIds.add(correlationId);
+        setTimeout(() => _handledCorrelationIds.delete(correlationId), 30000);
+    }
+
+    try {
+        const { text, delayMs = 20, initialDelayMs } = event.payload || {};
+
+        if (!text) {
+            throw new Error('text parameter is required');
+        }
+
+        // Optional initial delay to let UI focus transitions settle
+        if (typeof initialDelayMs === 'number' && initialDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, initialDelayMs));
+        }
+
+        let el = document.activeElement;
+        // Fall back to last focused element if active element is not typeable
+        // (focus may have shifted to a button, toolbar, or body between tool calls)
+        if (!el || el === document.body || el === document.documentElement || !isTypeable(el)) {
+            el = _lastFocusedElement;
+        }
+        // Third fallback: recover from stored click coordinates
+        if (!el || el === document.body || el === document.documentElement || !isTypeable(el)) {
+            const coords = (window as any).__mcpLastClickCoords;
+            if (coords && typeof coords.x === 'number' && typeof coords.y === 'number') {
+                let pointEl: Element | null = document.elementFromPoint(coords.x, coords.y);
+                while (pointEl && pointEl !== document.body) {
+                    if (isTypeable(pointEl)) break;
+                    pointEl = pointEl.parentElement;
+                }
+                if (pointEl && pointEl !== document.body && isTypeable(pointEl)) {
+                    el = pointEl;
+                    if (el instanceof HTMLElement) el.focus({ preventScroll: true });
+                    _lastFocusedElement = el;
+                }
+            }
+        }
+        if (!el || el === document.body || el === document.documentElement) {
+            throw new Error('No element is currently focused. Click an element first or use selector mode.');
+        }
+        // Re-focus the element to ensure it can receive input
+        if (el instanceof HTMLElement) {
+            el.focus();
+        }
+
+        const elementInfo: Record<string, string> = {
+            tag: el.tagName.toLowerCase(),
+        };
+        if (el.id) elementInfo.id = el.id;
+        if (el instanceof HTMLElement && el.className) elementInfo.className = el.className.toString().substring(0, 100);
+
+        // Route to the appropriate typing strategy
+        if (el instanceof HTMLSelectElement) {
+            elementInfo.strategy = 'select';
+            // For <select>, find the option whose text or value matches and select it
+            const lowerText = text.toLowerCase().trim();
+            let matched = false;
+            for (const opt of el.options) {
+                if (opt.text.toLowerCase().trim() === lowerText || opt.value.toLowerCase().trim() === lowerText) {
+                    opt.selected = true;
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                throw new Error(`No <option> matching "${text}" found in <select>${el.id ? ' #' + el.id : ''}.`);
+            }
+        } else if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            elementInfo.strategy = 'react-input';
+            // In focused mode, don't clear — append at the cursor position
+            await simulateReactInputTyping(el, text, delayMs, /* clear */ false);
+        } else if (el instanceof HTMLElement) {
+            // Check for Lexical editor (on the element itself or an ancestor)
+            const lexicalEl = el.closest('[data-lexical-editor]') || (el.hasAttribute('data-lexical-editor') ? el : null);
+            if (lexicalEl && lexicalEl instanceof HTMLElement) {
+                elementInfo.strategy = 'lexical';
+                await typeIntoLexicalEditor(lexicalEl, text, delayMs);
+            }
+            // Check for Slate editor
+            else {
+                const slateEl = el.closest('[data-slate-editor]') || (el.hasAttribute('data-slate-editor') ? el : null);
+                if (slateEl && slateEl instanceof HTMLElement) {
+                    elementInfo.strategy = 'slate';
+                    await typeIntoSlateEditor(slateEl, text, delayMs);
+                }
+                // Generic contentEditable
+                else if (el.isContentEditable) {
+                    elementInfo.strategy = 'contenteditable';
+                    await typeIntoContentEditable(el, text, delayMs);
+                }
+                // Last resort: try execCommand on focused element
+                else {
+                    elementInfo.strategy = 'execCommand-fallback';
+                    el.focus();
+                    const inserted = document.execCommand('insertText', false, text);
+                    if (!inserted) {
+                        throw new Error(`Cannot type into focused <${el.tagName.toLowerCase()}> element — it is not an editable field.`);
+                    }
+                }
+            }
+        } else {
+            throw new Error(`Cannot type into focused <${el.tagName.toLowerCase()}> element — unsupported element type.`);
+        }
+
+        await emitResponse('type-into-focused-response', correlationId, JSON.stringify({
+            success: true,
+            data: {
+                element: elementInfo,
+                charsTyped: text.length,
+            }
+        }));
+    } catch (error) {
+        await emitResponse('type-into-focused-response', correlationId, JSON.stringify({
             success: false,
             error: error instanceof Error ? error.message : String(error)
         }));

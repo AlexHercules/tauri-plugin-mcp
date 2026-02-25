@@ -41,6 +41,7 @@ pub use text_input::handle_simulate_text_input;
 pub use webview::{
     handle_get_dom, handle_get_element_position, handle_get_page_map, handle_send_text_to_element,
     handle_get_page_state, handle_navigate_back, handle_scroll_page, handle_fill_form, handle_wait_for,
+    handle_type_into_focused,
 };
 pub use webview_state::handle_manage_webview_state;
 pub use window_manager::handle_manage_window;
@@ -93,6 +94,7 @@ pub async fn handle_command<R: Runtime>(
         }),
         commands::MANAGE_ZOOM => handle_manage_zoom(app, payload).await,
         commands::MANAGE_WEBVIEW_STATE => handle_manage_webview_state(app, payload).await,
+        commands::TYPE_INTO_FOCUSED => handle_type_into_focused(app, payload).await,
         _ => Ok(SocketResponse {
             success: false,
             data: None,
@@ -174,6 +176,7 @@ mod tests {
             commands::MANAGE_DEVTOOLS,
             commands::MANAGE_ZOOM,
             commands::MANAGE_WEBVIEW_STATE,
+            commands::TYPE_INTO_FOCUSED,
         ];
 
         let mut seen = std::collections::HashSet::new();
@@ -184,6 +187,6 @@ mod tests {
                 cmd
             );
         }
-        assert_eq!(seen.len(), 24, "Expected 24 unique commands");
+        assert_eq!(seen.len(), 25, "Expected 25 unique commands");
     }
 }

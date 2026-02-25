@@ -46,7 +46,7 @@ pub async fn handle_execute_js<R: Runtime>(
         "execute-js-response",
         serde_json::json!(request.code),
         std::time::Duration::from_millis(timeout_ms),
-    ) {
+    ).await {
         Ok(result_string) => {
             let response: Value = serde_json::from_str(&result_string).map_err(|e| {
                 Error::Anyhow(format!("Failed to parse JS response: {}", e))

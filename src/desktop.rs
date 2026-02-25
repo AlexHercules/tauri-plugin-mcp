@@ -1,11 +1,7 @@
 use crate::error::Error;
 use crate::models::*;
 use crate::native_input::{self, TextParams};
-use crate::shared::{
-    McpInterface, MouseMovementParams, MouseMovementResult, ScreenshotParams,
-    ScreenshotResult as SharedScreenshotResult, TextInputParams, TextInputResult,
-    WindowManagerParams, WindowManagerResult,
-};
+use crate::shared::ScreenshotParams;
 use crate::socket_server::SocketServer;
 use crate::tools::mouse_movement;
 use crate::{PluginConfig, Result};
@@ -433,110 +429,10 @@ impl<R: Runtime> TauriMcp<R> {
 impl<R: Runtime> Drop for TauriMcp<R> {
     fn drop(&mut self) {
         if let Some(server) = &self.socket_server {
-            if let Ok(server) = server.lock() {
+            if let Ok(mut server) = server.lock() {
                 let _ = server.stop();
             }
         }
     }
 }
 
-// Let's implement the interface properly
-impl<R: Runtime> McpInterface for TauriMcp<R> {
-    fn take_screenshot_shared(
-        &self,
-        params: ScreenshotParams,
-    ) -> std::result::Result<SharedScreenshotResult, String> {
-        // Create a ScreenshotRequest from our interface params
-        let window_label = params.window_label.unwrap_or_else(|| "main".to_string());
-
-        let request = ScreenshotRequest {
-            window_label,
-            quality: params.quality,
-            max_width: params.max_width,
-            max_size_mb: params.max_size_mb,
-            output_dir: params.output_dir,
-            save_to_disk: params.save_to_disk,
-            thumbnail: params.thumbnail,
-        };
-        match tokio::runtime::Handle::current().block_on(self.take_screenshot_async(request)) {
-            Ok(response) => {
-                // Convert to the shared result type
-                Ok(SharedScreenshotResult {
-                    success: response.success,
-                    error: response.error,
-                    data: response.data,
-                    mime_type: Some("image/jpeg".to_string()),
-                    file_path: response.file_path,
-                })
-            }
-            Err(err) => {
-                // Convert the error type
-                Err(err.to_string())
-            }
-        }
-    }
-
-    fn manage_window_shared(
-        &self,
-        params: WindowManagerParams,
-    ) -> std::result::Result<WindowManagerResult, String> {
-        // Convert from shared types to internal types
-        let request = WindowManagerRequest {
-            window_label: params.window_label,
-            operation: params.operation,
-            x: params.x,
-            y: params.y,
-            width: params.width,
-            height: params.height,
-        };
-
-        // Call the async method in a blocking manner
-        match tokio::runtime::Handle::current().block_on(self.manage_window_async(request)) {
-            Ok(response) => Ok(WindowManagerResult {
-                success: response.success,
-                error: response.error,
-            }),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    fn simulate_text_input_shared(
-        &self,
-        params: TextInputParams,
-    ) -> std::result::Result<TextInputResult, String> {
-        // Convert shared params to internal type
-        let request = TextInputRequest {
-            text: params.text,
-            delay_ms: params.delay_ms,
-            initial_delay_ms: params.initial_delay_ms,
-            window_label: params.window_label,
-        };
-
-        // Run async method using existing Tokio runtime
-        let result = tokio::runtime::Handle::current()
-            .block_on(self.simulate_text_input_async(request));
-
-        // Convert result to shared type
-        match result {
-            Ok(response) => Ok(TextInputResult {
-                success: true,
-                chars_typed: response.chars_typed,
-                duration_ms: response.duration_ms,
-                error: None,
-            }),
-            Err(e) => Ok(TextInputResult {
-                success: false,
-                chars_typed: 0,
-                duration_ms: 0,
-                error: Some(e.to_string()),
-            }),
-        }
-    }
-
-    fn simulate_mouse_movement_shared(
-        &self,
-        params: MouseMovementParams,
-    ) -> std::result::Result<MouseMovementResult, String> {
-        crate::tools::mouse_movement::simulate_mouse_movement_shared(&self.app, params)
-    }
-}

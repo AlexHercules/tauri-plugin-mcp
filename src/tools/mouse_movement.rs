@@ -5,7 +5,6 @@ use crate::error::Error;
 use crate::models::MouseMovementRequest;
 use crate::native_input::{self, MouseButton, MouseParams};
 use crate::native_input::state::VirtualCursorState;
-use crate::shared::{MouseMovementParams, MouseMovementResult};
 use crate::socket_server::SocketResponse;
 use std::time::Instant;
 use log::info;
@@ -64,6 +63,31 @@ pub async fn simulate_mouse_movement_async<R: Runtime>(
     // Update virtual cursor state
     cursor_state.set(result.position.0, result.position.1);
 
+    // After a click, inject JS to focus the nearest typeable element at click coords.
+    // This ensures the guest-js _lastFocusedElement tracker picks up the focus change,
+    // so subsequent type_text calls in focused mode (no selector) find the right element.
+    if click {
+        let focus_js = format!(
+            r#"(function(){{
+                var el = document.elementFromPoint({x},{y});
+                if(!el) return;
+                window.__mcpLastClickCoords={{x:{x},y:{y}}};
+                var t=el;
+                while(t&&t!==document.body){{
+                    var tag=t.tagName;
+                    if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT') break;
+                    if(t.isContentEditable) break;
+                    if(t.hasAttribute&&(t.hasAttribute('data-lexical-editor')||t.hasAttribute('data-slate-editor'))) break;
+                    if(t.closest&&(t.closest('[data-lexical-editor]')||t.closest('[data-slate-editor]'))) break;
+                    t=t.parentElement;
+                }}
+                if(t&&t!==document.body&&t.focus){{t.focus({{preventScroll:true}});}}
+            }})()"#,
+            x = target_x, y = target_y
+        );
+        let _ = webview.eval(&focus_js);
+    }
+
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
     info!(
@@ -76,43 +100,6 @@ pub async fn simulate_mouse_movement_async<R: Runtime>(
         duration_ms,
         position: Some(result.position),
     })
-}
-
-pub fn simulate_mouse_movement_shared<R: Runtime>(
-    app: &AppHandle<R>,
-    params: MouseMovementParams,
-) -> std::result::Result<MouseMovementResult, String> {
-    // Convert shared params to internal type
-    let request = MouseMovementRequest {
-        x: params.x,
-        y: params.y,
-        relative: params.relative,
-        click: params.click,
-        button: params.button,
-        window_label: params.window_label,
-        mouse_down: params.mouse_down,
-        mouse_up: params.mouse_up,
-    };
-
-    // Run async method using existing Tokio runtime
-    let result = tokio::runtime::Handle::current()
-        .block_on(simulate_mouse_movement_async(app, request));
-
-    // Convert result to shared type
-    match result {
-        Ok(response) => Ok(MouseMovementResult {
-            success: true,
-            duration_ms: response.duration_ms,
-            position: response.position,
-            error: None,
-        }),
-        Err(e) => Ok(MouseMovementResult {
-            success: false,
-            duration_ms: 0,
-            position: None,
-            error: Some(e.to_string()),
-        }),
-    }
 }
 
 pub async fn handle_simulate_mouse_movement<R: Runtime>(

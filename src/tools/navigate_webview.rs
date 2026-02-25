@@ -79,7 +79,7 @@ pub async fn handle_navigate_webview<R: Runtime>(
                 "navigate-webview-response",
                 js_payload,
                 std::time::Duration::from_secs(5),
-            ) {
+            ).await {
                 Ok(result) => Ok(parse_js_response(&result)),
                 Err(e) => Ok(SocketResponse {
                     success: false,

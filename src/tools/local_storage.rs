@@ -71,7 +71,7 @@ pub async fn handle_get_local_storage<R: Runtime>(
         "get-local-storage-response",
         payload_value,
         std::time::Duration::from_secs(5),
-    ) {
+    ).await {
         Ok(result_string) => {
             let response: Value = serde_json::from_str(&result_string).map_err(|e| {
                 Error::Anyhow(format!("Failed to parse localStorage response: {}", e))

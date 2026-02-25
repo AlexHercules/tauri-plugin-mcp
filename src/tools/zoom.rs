@@ -52,7 +52,7 @@ pub async fn handle_manage_zoom<R: Runtime>(
                 "manage-zoom-response",
                 serde_json::json!({"action": "get"}),
                 std::time::Duration::from_secs(5),
-            ) {
+            ).await {
                 Ok(result) => Ok(parse_js_response(&result)),
                 Err(e) => Ok(SocketResponse {
                     success: false,

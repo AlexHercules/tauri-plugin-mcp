@@ -115,35 +115,6 @@ pub struct MouseMovementResult {
     pub error: Option<String>,
 }
 
-/// Main interface trait for MCP functionality
-pub trait McpInterface {
-    /// Takes a screenshot of the specified window
-    fn take_screenshot_shared(
-        &self,
-        params: ScreenshotParams,
-    ) -> std::result::Result<ScreenshotResult, String>;
-
-    /// Manages window operations (resize, position, show/hide, etc.)
-    fn manage_window_shared(
-        &self,
-        params: WindowManagerParams,
-    ) -> std::result::Result<WindowManagerResult, String>;
-
-    /// Simulates keyboard text input
-    fn simulate_text_input_shared(
-        &self,
-        params: TextInputParams,
-    ) -> std::result::Result<TextInputResult, String>;
-
-    /// Simulates mouse movement
-    fn simulate_mouse_movement_shared(
-        &self,
-        params: MouseMovementParams,
-    ) -> std::result::Result<MouseMovementResult, String>;
-
-    // Add other shared functions here
-}
-
 /// Command string constants for socket commands
 pub mod commands {
     pub const PING: &str = "ping";
@@ -170,4 +141,5 @@ pub mod commands {
     pub const MANAGE_DEVTOOLS: &str = "manage_devtools";
     pub const MANAGE_ZOOM: &str = "manage_zoom";
     pub const MANAGE_WEBVIEW_STATE: &str = "manage_webview_state";
+    pub const TYPE_INTO_FOCUSED: &str = "type_into_focused";
 }

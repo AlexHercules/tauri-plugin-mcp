@@ -18,7 +18,12 @@ export function registerMouseActionTool(server: McpServer) {
       end_y: z.number().optional().describe("(drag) End Y coordinate."),
       // scroll params
       direction: z.enum(["down", "up"]).optional().describe("(scroll) Scroll direction. Default: 'down'."),
-      amount: z.union([z.number(), z.literal("page"), z.literal("half")]).optional().describe("(scroll) Pixel count, 'page', or 'half'. Default: one full page."),
+      amount: z.union([
+        z.number(),
+        z.literal("page"),
+        z.literal("half"),
+        z.string().refine((s) => !isNaN(Number(s)) && s.trim() !== '', "Must be a valid number").transform(Number),
+      ]).optional().describe("(scroll) Pixel count, 'page', or 'half'. Default: one full page."),
       to_ref: z.number().int().optional().describe("(scroll) Scroll to bring this element ref into view."),
       to_top: z.boolean().optional().describe("(scroll) Scroll to top of page."),
       to_bottom: z.boolean().optional().describe("(scroll) Scroll to bottom of page."),

@@ -21,6 +21,7 @@
     "build-plugin": "cargo build --release",
     "build:server": "cd mcp-server-ts && pnpm i && pnpm build",
     "build:all": "pnpm build && pnpm build-plugin && pnpm build:server",
+    "clean": "rm -rf node_modules dist-js target mcp-server-ts/node_modules mcp-server-ts/dist",
     "prepublishOnly": "pnpm build",
     "pretest": "pnpm build"
   },

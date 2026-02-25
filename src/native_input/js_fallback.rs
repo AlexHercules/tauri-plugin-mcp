@@ -49,8 +49,23 @@ pub fn inject_mouse_via_js<R: Runtime>(
             x = x, y = y, btn = button_num
         ));
 
-        // Focus the element if it's focusable
-        js.push_str("if (el.focus) { el.focus(); }\n");
+        // Focus the nearest typeable ancestor and store click coords for fallback recovery
+        js.push_str(&format!(
+            r#"
+            window.__mcpLastClickCoords={{x:{x},y:{y}}};
+            var ft=el;
+            while(ft&&ft!==document.body){{
+                var ftag=ft.tagName;
+                if(ftag==='INPUT'||ftag==='TEXTAREA'||ftag==='SELECT') break;
+                if(ft.isContentEditable) break;
+                if(ft.hasAttribute&&(ft.hasAttribute('data-lexical-editor')||ft.hasAttribute('data-slate-editor'))) break;
+                if(ft.closest&&(ft.closest('[data-lexical-editor]')||ft.closest('[data-slate-editor]'))) break;
+                ft=ft.parentElement;
+            }}
+            if(ft&&ft!==document.body&&ft.focus){{ft.focus({{preventScroll:true}});}}
+            "#,
+            x = x, y = y
+        ));
     } else if params.mouse_down {
         js.push_str(&format!(
             r#"

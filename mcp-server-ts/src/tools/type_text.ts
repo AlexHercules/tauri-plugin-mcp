@@ -116,6 +116,7 @@ export function registerTypeTextTool(server: McpServer) {
         }
 
         // Mode 3: Type into focused element (no selector, no fields)
+        // Uses JS-based typing which works with Lexical, Slate, contentEditable, and standard inputs
         if (!params.text) {
           return createErrorResponse("'text' is required when not using fields or selector mode");
         }
@@ -127,10 +128,23 @@ export function registerTypeTextTool(server: McpServer) {
         if (params.delay_ms !== undefined) payload.delay_ms = params.delay_ms;
         if (params.initial_delay_ms !== undefined) payload.initial_delay_ms = params.initial_delay_ms;
 
-        logCommandParams('simulate_text_input', payload);
-        await socketClient.sendCommand('simulate_text_input', payload);
+        logCommandParams('type_into_focused', payload);
+        const result = await socketClient.sendCommand('type_into_focused', payload);
 
-        return createSuccessResponse(`Successfully simulated typing of ${params.text.length} characters`);
+        if (!result || typeof result !== 'object') {
+          return createErrorResponse('Failed to get a valid response from type_into_focused');
+        }
+
+        if ('success' in result && !result.success) {
+          return createErrorResponse(result.error as string || 'type_into_focused failed');
+        }
+
+        const data = (result as any).data ?? result;
+        const elementInfo = data?.element || {};
+        const strategy = elementInfo.strategy ? ` (strategy: ${elementInfo.strategy})` : '';
+        return createSuccessResponse(
+          `Successfully typed ${params.text.length} characters into focused ${elementInfo.tag || 'element'}${elementInfo.id ? ` #${elementInfo.id}` : ''}${strategy}`
+        );
       } catch (error) {
         console.error('type_text error:', error);
         return createErrorResponse(`Failed to type text: ${(error as Error).message}`);

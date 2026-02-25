@@ -22,7 +22,7 @@ mod native_input;
 
 pub use error::{Error, Result};
 pub use shared::{
-    McpInterface, ScreenshotParams, ScreenshotResult, WindowManagerParams, WindowManagerResult,
+    ScreenshotParams, ScreenshotResult, WindowManagerParams, WindowManagerResult,
 };
 
 #[cfg(desktop)]
@@ -182,6 +182,11 @@ pub fn init_with_config<R: Runtime>(config: PluginConfig) -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
         // Server Commands
         ])
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                let _ = webview.eval(include_str!("listener_patch.js"));
+            }
+        })
         .setup(move |app, api| {
             info!("[TAURI_MCP] Setting up plugin");
             #[cfg(mobile)]

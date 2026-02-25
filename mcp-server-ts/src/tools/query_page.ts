@@ -75,6 +75,7 @@ export function registerQueryPageTool(server: McpServer) {
       quiet_ms: z.number().int().nonnegative().optional().describe("(map) Milliseconds of mutation silence for stability. Default: 300."),
       max_wait_ms: z.number().int().nonnegative().optional().describe("(map) Max wait for DOM stability in ms. Default: 3000."),
       timeout_secs: z.number().int().positive().optional().describe("(map) Rust-side timeout in seconds. Default: 10."),
+      include_metadata: z.boolean().optional().describe("(map) Include structured page metadata (JSON-LD, OpenGraph, description). Default: true."),
       // find_element mode options
       selector_type: z.enum(["ref", "id", "class", "tag", "text"]).optional().describe("(find_element) Selector type. 'ref' uses numbered reference from map mode."),
       selector_value: z.string().optional().describe("(find_element) Selector value. For 'ref', the ref number as string."),
@@ -120,6 +121,7 @@ export function registerQueryPageTool(server: McpServer) {
               interactive_only: params.interactive_only ?? false,
               delta: params.delta ?? false,
               wait_for_stable: params.wait_for_stable ?? false,
+              include_metadata: params.include_metadata ?? true,
             };
             if (params.scope_selector !== undefined) payload.scope_selector = params.scope_selector;
             if (params.max_depth !== undefined) payload.max_depth = params.max_depth;

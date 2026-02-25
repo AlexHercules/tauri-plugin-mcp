@@ -12,40 +12,6 @@ pub struct PingResponse {
     pub value: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowControlRequest {
-    pub window_label: String,
-    pub action: WindowAction,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum WindowAction {
-    Minimize,
-    Maximize,
-    Unmaximize,
-    Close,
-    Show,
-    Hide,
-    SetTitle { title: String },
-    SetPosition { x: f64, y: f64 },
-    SetSize { width: f64, height: f64 },
-    SetFullscreen { fullscreen: bool },
-    Center,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowControlResponse {
-    pub success: bool,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowListRequest {}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowListResponse {
@@ -61,54 +27,6 @@ pub struct WindowInfo {
     pub is_focused: bool,
     pub is_maximized: bool,
     pub is_fullscreen: bool,
-}
-
-// New MCP JavaScript execution models
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvalJsRequest {
-    pub window_label: String,
-    pub script: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvalJsResponse {
-    pub result: Option<String>,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-// Element related models
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ElementRequest {
-    pub window_label: String,
-    pub selector: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetElementValueRequest {
-    pub window_label: String,
-    pub selector: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ElementResponse {
-    pub value: Option<String>,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-// Type text into focused element
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TypeTextRequest {
-    pub window_label: String,
-    pub text: String,
 }
 
 // Screenshot request - updated to use shared interface
@@ -162,37 +80,6 @@ impl From<crate::shared::ScreenshotResult> for ScreenshotResponse {
             file_path: result.file_path,
         }
     }
-}
-
-// URL and title requests
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebviewInfoRequest {
-    pub window_label: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UrlResponse {
-    pub url: Option<String>,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TitleResponse {
-    pub title: Option<String>,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HtmlResponse {
-    pub html: Option<String>,
-    pub success: bool,
-    pub error: Option<String>,
 }
 
 // LocalStorage request model
