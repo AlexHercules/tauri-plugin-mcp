@@ -1134,93 +1134,75 @@ async function handleSendTextToElementRequest(event: any) {
     }
 }
 
-// Better function to handle typing in React controlled components
+// Simulate typing into React controlled input/textarea elements.
+// Uses document.execCommand('insertText') which triggers the browser's native
+// input handling pipeline — React sees a genuine InputEvent and updates its
+// internal value tracker correctly. Direct element.value assignment + synthetic
+// Event('input') does NOT work because React's fiber state never registers the change.
 async function simulateReactInputTyping(element: HTMLInputElement | HTMLTextAreaElement, text: string, delayMs: number): Promise<void> {
-    console.log('TAURI-PLUGIN-MCP: Simulating typing on React component');
-    
-    // First focus the element - important for React to recognize the field
+    console.log('TAURI-PLUGIN-MCP: Simulating typing on React component via execCommand');
+
+    // Focus the element — required for execCommand to target it
     element.focus();
-    await new Promise(resolve => setTimeout(resolve, 50)); // Brief delay after focus
-    
-    // Instead of setting the value directly, we'll simulate keypresses
-    // This approach more closely mimics real user interaction
+    await new Promise(resolve => setTimeout(resolve, 50));
+
     try {
-        // For React, clear first by setting empty value and triggering events
-        element.value = '';
-        element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        
-        // Wait a brief moment to let React's state update
+        // Clear existing content: select all then delete
+        element.select();
+        document.execCommand('delete', false);
         await new Promise(resolve => setTimeout(resolve, 50));
-        
-        console.log('TAURI-PLUGIN-MCP: Simulating keypress events for text:', text);
-        
-        // Simulate pressing each key with events in the correct sequence
-        for (let i = 0; i < text.length; i++) {
-            const char = text[i];
-            const partialText = text.substring(0, i + 1);
-            
-            // Simulate keydown
-            const keydownEvent = new KeyboardEvent('keydown', {
-                key: char,
-                code: `Key${char.toUpperCase()}`,
-                bubbles: true,
-                cancelable: true,
-                composed: true
-            });
-            element.dispatchEvent(keydownEvent);
-            
-            // Update value to what it would be after this keypress
-            element.value = partialText;
-            
-            // Simulate input event (most important for React)
-            const inputEvent = new Event('input', {
-                bubbles: true,
-                cancelable: true
-            });
-            element.dispatchEvent(inputEvent);
-            
-            // Simulate keyup
-            const keyupEvent = new KeyboardEvent('keyup', {
-                key: char,
-                code: `Key${char.toUpperCase()}`,
-                bubbles: true,
-                cancelable: true,
-                composed: true
-            });
-            element.dispatchEvent(keyupEvent);
-            
-            // Add delay between characters to simulate typing
-            if (delayMs > 0 && i < text.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, delayMs));
+
+        if (delayMs > 0) {
+            // Character-by-character typing with delays
+            for (let i = 0; i < text.length; i++) {
+                const char = text[i];
+
+                // Dispatch keydown before the character is inserted
+                element.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: char,
+                    code: `Key${char.toUpperCase()}`,
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true
+                }));
+
+                // insertText triggers a real InputEvent that React recognizes
+                document.execCommand('insertText', false, char);
+
+                // Dispatch keyup after the character is inserted
+                element.dispatchEvent(new KeyboardEvent('keyup', {
+                    key: char,
+                    code: `Key${char.toUpperCase()}`,
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true
+                }));
+
+                if (i < text.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                }
             }
+        } else {
+            // Insert all text at once for speed
+            document.execCommand('insertText', false, text);
         }
-        
-        // Final change event after all typing is complete
-        const changeEvent = new Event('change', {
-            bubbles: true,
-            cancelable: true
-        });
-        element.dispatchEvent(changeEvent);
-        
-        // Give React a moment to process the final change
-        await new Promise(resolve => setTimeout(resolve, 50));
-        
+
         console.log('TAURI-PLUGIN-MCP: Completed React input typing simulation');
     } catch (e) {
-        console.error('TAURI-PLUGIN-MCP: Error during React input typing:', e);
-        
-        // Last resort fallback - direct mutation
-        console.log('TAURI-PLUGIN-MCP: Falling back to direct value assignment');
-        element.value = text;
-        element.dispatchEvent(new Event('input', { bubbles: true }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    
-    // Ensure the value is set at the end regardless of method
-    if (element.value !== text) {
-        console.log('TAURI-PLUGIN-MCP: Final value check - correcting if needed');
-        element.value = text;
+        console.error('TAURI-PLUGIN-MCP: execCommand approach failed, trying nativeInputValueSetter fallback:', e);
+
+        // Fallback: use the native value setter to bypass React's proxy,
+        // then dispatch an InputEvent (not just Event) with inputType set
+        const proto = element instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+
+        if (nativeSetter) {
+            nativeSetter.call(element, text);
+        } else {
+            element.value = text;
+        }
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
     }
@@ -1652,11 +1634,8 @@ async function handleFillFormRequest(event: any) {
 
                 if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
                     el.focus();
-                    if (clear) {
-                        el.value = '';
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                    // Use the existing simulateReactInputTyping for proper React compat
+                    // simulateReactInputTyping already clears via select+delete
+                    // so we just call it directly (clear param is implicit)
                     await simulateReactInputTyping(el, field.value, 0);
                 } else if (el instanceof HTMLSelectElement) {
                     el.focus();

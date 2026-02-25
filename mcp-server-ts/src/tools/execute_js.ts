@@ -6,7 +6,7 @@ import { createErrorResponse, createSuccessResponse, formatResultAsText, logComm
 export function registerExecuteJsTool(server: McpServer) {
   server.tool(
     "execute_js",
-    "Executes arbitrary JavaScript code within the context of a specified application window's webview (e.g., a Tauri webview). Returns the result of the last executed statement or a promise resolution. Caution: This tool is destructive and can modify the window's content, state, or trigger unintended actions. Use with careful consideration of the code being executed.",
+    "Executes arbitrary JavaScript in a webview. Returns the result of the last statement or promise resolution. This is the universal escape hatch — use it for anything not covered by other tools. For Tauri event system access (emit, listen, sniff), use `window.__TAURI__` APIs directly. Caution: can modify page state.",
     {
       code: z.string().describe("Required. The string of JavaScript code to be executed in the target window's webview context. Ensure the code is safe and achieves the intended purpose. Malformed or malicious code can lead to errors or unwanted behavior."),
       window_label: z.string().default("main").describe("The identifier (e.g., visible title or internal label) of the application window where the JavaScript code will be executed. Defaults to 'main' if not specified."),

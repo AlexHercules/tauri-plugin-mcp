@@ -6,7 +6,7 @@ import { registerAllTools, initializeSocket } from "./tools/index.js";
 const server = new McpServer({
   name: "tauri-mcp",
   version: "1.0.0",
-  instructions: "Workflow: Start with get_app_info or list_windows to discover the app environment. Use get_page_map for numbered refs to interactive elements, then use those refs with get_element_position, send_text_to_element, scroll_page, or fill_form. Use get_page_state for lightweight URL/readyState checks. Use navigate_webview for URL navigation, manage_cookies for cookie inspection, manage_devtools for DevTools control, manage_zoom for zoom, and manage_events for event debugging. Prefer get_page_map over get_dom for structured element access.",
+  instructions: "Workflow: Start with query_page(mode='app_info') to discover the app. Use query_page(mode='map') for numbered refs, then click or type_text to interact. Use query_page(mode='state') for lightweight checks. Use navigate for URLs, manage_storage for localStorage/cookies, manage_window for window/zoom/devtools. Use execute_js as the universal escape hatch.",
   capabilities: {
     resources: {},
     tools: {},

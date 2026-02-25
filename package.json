@@ -19,6 +19,8 @@
   "scripts": {
     "build": "rollup -c",
     "build-plugin": "cargo build --release",
+    "build:server": "cd mcp-server-ts && pnpm i && pnpm build",
+    "build:all": "pnpm build && pnpm build-plugin && pnpm build:server",
     "prepublishOnly": "pnpm build",
     "pretest": "pnpm build"
   },
