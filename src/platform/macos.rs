@@ -293,7 +293,6 @@ fn find_window(xcap_windows: &[xcap::Window], window_title: &str, application_na
             window.is_minimized()
         );
     }
-    debug!("[TAURI-MCP] ======================================");
 
     // Check if we might have a permissions issue (only Window Server menubar visible)
     if xcap_windows.len() <= 1 {
@@ -310,18 +309,12 @@ fn find_window(xcap_windows: &[xcap::Window], window_title: &str, application_na
     // Step 1: First pass - direct application name match (highest priority)
     if !application_name_lower.is_empty() {
         for window in xcap_windows {
-            if window.is_minimized() {
-                continue;
-            }
-
+            if window.is_minimized() { continue; }
             let app_name = window.app_name().to_lowercase();
 
             // Direct match for application name - highest priority
             if app_name.contains(&application_name_lower) {
-                info!(
-                    "[TAURI-MCP] Found window by app name: '{}'",
-                    window.app_name()
-                );
+                info!("[TAURI-MCP] Found window by app name: '{}'", window.app_name());
                 return Some(window.clone());
             }
         }
@@ -368,6 +361,16 @@ fn find_window(xcap_windows: &[xcap::Window], window_title: &str, application_na
                 "[TAURI-MCP] Found window by partial title match: '{}'",
                 window.title()
             );
+            return Some(window.clone());
+        }
+    }
+
+    // Step 5: Fuzzy match for "novel" in app name
+    for window in xcap_windows {
+        if window.is_minimized() { continue; }
+        let app_name = window.app_name().to_lowercase();
+        if app_name.contains("novel") {
+            info!("[TAURI-MCP] Found window by fuzzy app name: '{}'", window.app_name());
             return Some(window.clone());
         }
     }
